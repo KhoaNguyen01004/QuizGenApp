@@ -1,3 +1,4 @@
 pymupdf4llm
 marker-pdf
 ollama
+requests

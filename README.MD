@@ -85,47 +85,139 @@ def extract_pdf_to_md(path):
 
 ---
 
-## 🚀 Quick Start
+## 🚀 Quick Start Guide
+
+Follow these step-by-step instructions to set up and run QuizGenApp.
 
 ### Prerequisites
-- Python 3.12+
-- Ollama installed and running (`ollama serve`)
-- NVIDIA GPU with ≥4GB VRAM (recommended)
+- **Python 3.12+** (check with `python --version`)
+- **NVIDIA GPU with ≥4GB VRAM** (recommended for speed)
+- **Ollama** (for AI model inference)
 
-#### 🔧 GPU Acceleration (for faster PDF extraction)
-Marker library (used in PDFExtractor) requires PyTorch CUDA:
+---
 
-```
-quizgenvenv\Scripts\activate
-pip uninstall torch torchvision torchaudio -y
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-```
+### Step 1: Install Ollama (AI Models)
+1. Download Ollama from [https://ollama.com/download](https://ollama.com/download)
+2. Install and run Ollama
+3. Pull required models:
+   ```bash
+   ollama pull qwen3:1.7b
+   ollama pull phi4-mini:latest
+   ```
+4. Verify installation:
+   ```bash
+   ollama list
+   ollama serve  # Start Ollama server (keep running in background)
+   ```
 
-**Verify:**
-```
-python -c "import torch; print('CUDA:', torch.cuda.is_available(), torch.version.cuda)"
-```
-Expected: `CUDA: True 12.1`
+---
 
-**Note:** If `torch.cuda.is_available()` is False after install:
-- Check `nvidia-smi` (driver/CUDA 12.1+)
-- Restart terminal/VSCode
+### Step 2: Set Up Python Environment
+1. Clone or download the project
+2. Navigate to project directory:
+   ```bash
+   cd path/to/QuizGenApp
+   ```
+3. Create virtual environment:
+   ```bash
+   python -m venv .venv
+   ```
+4. Activate virtual environment:
+   ```powershell
+   # Windows PowerShell
+   .venv\Scripts\Activate.ps1
+   ```
+   ```bash
+   # Linux/Mac
+   source .venv/bin/activate
+   ```
 
-### 1. Virtual Environment & GPU Setup
-```powershell
-# Windows PowerShell
-. quizgenvenv/Scripts/Activate.ps1
-# Or CMD
-quizgenvenv\\Scripts\\activate.bat
+---
 
+### Step 3: Install Python Dependencies
+```bash
 pip install -r requirements.txt
+```
 
-# GPU setup (if NVIDIA GPU)
+---
+
+### Step 4: Enable GPU Acceleration (Optional but Recommended)
+GPU acceleration speeds up PDF processing and AI generation significantly.
+
+#### For PDF Extraction (PyTorch CUDA):
+```bash
+# Remove CPU-only PyTorch
 pip uninstall torch torchvision torchaudio -y
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
-# Verify GPU
-python -c \"import torch; print('GPU ready:', torch.cuda.is_available())\"
+# Install CUDA-enabled PyTorch (CUDA 12.1)
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+```
+
+#### Verify GPU Setup:
+```bash
+# Check PyTorch CUDA
+python -c "import torch; print('PyTorch CUDA available:', torch.cuda.is_available())"
+
+# Check NVIDIA GPU
+nvidia-smi
+```
+
+**Note:** You may see dependency conflicts with `marker-pdf` requiring torch>=2.7.0, but torch 2.5.1+cu121 works correctly. These warnings are safe to ignore.
+
+#### For Ollama GPU (Automatic):
+Ollama automatically uses GPU if:
+- NVIDIA drivers are installed
+- CUDA is available
+- GPU has sufficient VRAM
+
+Verify with:
+```bash
+ollama ps  # Shows GPU usage
+```
+
+**Note:** If GPU setup fails, the app will run on CPU (slower but functional).
+
+---
+
+### Step 5: Prepare Your PDF
+1. Place your lecture PDF file in the project root directory
+   - Example: `Chapter 2. Transformation.pdf`
+2. Ensure the PDF contains academic content (equations, text, etc.)
+
+---
+
+### Step 6: Run the Application
+```bash
+python main.py
+```
+
+**Expected Output:**
+```
+2026-04-28 XX:XX:XX - INFO - Processing Chapter 2. Transformation.pdf
+2026-04-28 XX:XX:XX - INFO - GPU detected and will be used for PDF extraction.
+2026-04-28 XX:XX:XX - INFO - Ollama GPU status: Ollama running (GPU support depends on installation)
+...processing logs...
+2026-04-28 XX:XX:XX - INFO - Quiz saved to Generated_Quiz.md
+```
+
+---
+
+### Step 7: View Results
+- **Quiz file**: `Generated_Quiz.md` (in project root)
+- **Debug files** (in `outputs/` folder):
+  - `knowledge_bricks.md` (extracted concepts)
+  - `pedagogue_response.txt` (raw AI response)
+  - `raw_extracted_pedagogue.json` (parsed quiz data)
+
+---
+
+## 📋 Alternative: Automated GPU Setup
+Run the provided setup script:
+```powershell
+.\setup_gpu.ps1
+```
+
+This script handles PyTorch CUDA installation and provides Ollama GPU instructions.
 ```
 
 
