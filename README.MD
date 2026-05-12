@@ -59,9 +59,9 @@ The system processes data through a pipeline of specialized agents:
 | Agent | Model | Responsibility | Approx. VRAM |
 |------|------|----------------|-------------|
 | **Curator** | `qwen3:1.7b` | Knowledge extraction | ~1.1 GB |
-| **Pedagogue** | `phi4-mini` | Question generation | ~2.3 GB |
-| **Adversary** | `gemma3:4b` | Fact-checking & validation | ~2.6 GB |
-| **Explainer** | `llama3.2:1b` | Answer explanation | ~0.8 GB |
+| **Pedagogue** | `llama3.2:3b` | Question generation | ~1.8 GB |
+| **Adversary** | `llama3.2:3b` | Fact-checking & validation | ~1.8 GB |
+| **Explainer** | `llama3.2:3b` | Answer explanation | ~1.8 GB |
 
 > ⚠️ Models are loaded sequentially to stay within 4GB VRAM constraints.
 

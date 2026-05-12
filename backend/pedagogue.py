@@ -1,16 +1,22 @@
-import concurrent.futures
-import json
-import re
-import ollama
-import logging
-from pathlib import Path
-from typing import List, Dict, Any, Optional
+# import concurrent.futures
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+import json
+import logging
+import re
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import ollama
+
+from backend.utils.markdown_cleaner import clean_markdown_output
+
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
 
 class PedagogueAgent:
-    def __init__(self, model: str = "phi4-mini:latest", timeout: int = 180):
+
+    def __init__(self, model: str = "llama3.2:3b", timeout: int = 180):
         self.model = model
         self.timeout = timeout
         self._log_gpu_status()
@@ -18,23 +24,31 @@ class PedagogueAgent:
     def _log_gpu_status(self):
         """Log GPU availability for Ollama."""
         try:
-            # Check if Ollama has GPU info
             info = ollama.ps()
             gpu_info = "GPU support unknown"
-            # Ollama doesn't expose GPU info directly, but we can check if models are loaded
-            if info and len(info) > 0:
+
+            has_models = False
+            if hasattr(info, "models") and info.models:
+                has_models = True
+            elif isinstance(info, (list, dict)) and len(info) > 0:
+                has_models = True
+
+            if has_models:
                 gpu_info = "Ollama running (GPU support depends on installation)"
             logging.info(f"Ollama GPU status: {gpu_info}")
         except Exception as e:
             logging.warning(f"Could not check Ollama GPU status: {e}")
 
     def _run_with_timeout(self, fn, *args, timeout: int = 180, **kwargs):
+        """Thread-based timeout wrapper."""
+        import concurrent.futures
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(fn, *args, **kwargs)
             try:
                 return future.result(timeout=timeout)
             except concurrent.futures.TimeoutError:
-                logging.error("Ollama request timed out after %s seconds.", timeout)
+                logging.error("Ollama request timed out after %s seconds (timeout).", timeout)
                 return None
             except Exception as exc:
                 logging.error("Ollama request failed: %s", exc)
@@ -48,210 +62,281 @@ class PedagogueAgent:
         except Exception:
             return False
 
-    def _parse_json(self, text: str) -> List[Dict[str, Any]]:
-        # Improved extraction: handle full array with balanced brackets
-        def extract_full_array(s):
-            start = -1
-            bracket_count = 0
-            i = 0
-            n = len(s)
-            in_string = False
-            escape = False
+    def _extract_last_json_array(self, text: str) -> Optional[str]:
+        """Extract the last complete top-level JSON array from arbitrary text.
 
-            # Find start of array
-            while i < n:
-                c = s[i]
-                if c == '"' and not escape:
-                    in_string = not in_string
-                elif not in_string:
-                    if c == '[':
-                        start = i
-                        bracket_count = 1
-                        break
-                escape = c == '\\' and not escape
-                i += 1
-
-            if start == -1:
-                return None
-
-            # Balance to find end
-            i = start + 1
-            while i < n:
-                c = s[i]
-                if c == '"' and not escape:
-                    in_string = not in_string
-                elif not in_string:
-                    if c == '[':
-                        bracket_count += 1
-                    elif c == ']':
-                        bracket_count -= 1
-                        if bracket_count == 0:
-                            return s[start:i+1].strip()
-                escape = c == '\\' and not escape
-                i += 1
-
-            # If unbalanced, take from start to end if array-like
-            if bracket_count > 0:
-                # Auto-repair: append closing ]
-                return s[start:].strip() + ']'
-
+        This is a best-effort bracket matcher that tracks whether we're inside
+        strings and escapes.
+        """
+        s = text.strip()
+        if not s:
             return None
 
-        # Remove common markdown/code fences that models add (```json, ```)
-        text = text.replace('```json', '').replace('```', '')
+        last = None
+        start = None
+        depth = 0
+        in_string = False
+        escape = False
 
-        json_str = extract_full_array(text)
+        for i, c in enumerate(s):
+            if c == '"' and not escape:
+                in_string = not in_string
+            if in_string:
+                escape = (c == "\\") and not escape
+                continue
 
-        if not json_str or not json_str.startswith('['):
-            logging.warning("Could not find a valid JSON array in the response.")
-            return []
+            if c == '[':
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif c == ']':
+                if depth > 0:
+                    depth -= 1
+                    if depth == 0 and start is not None:
+                        candidate = s[start : i + 1].strip()
+                        last = candidate
+                        start = None
 
-        # Save raw extracted
+            escape = (c == "\\") and not escape
+
+        return last
+
+    def _parse_json(self, text: str) -> List[Dict[str, Any]]:
+        """Parse Pedagogue output into a list of question objects."""
         OUTPUT_DIR = Path("outputs")
         OUTPUT_DIR.mkdir(exist_ok=True)
-        raw_path = OUTPUT_DIR / "raw_extracted_pedagogue.json"
-        raw_path.write_text(json_str, encoding="utf-8")
 
-        # Minimal fixes
-        json_str = re.sub(r',\s*([}\]])', r'\1', json_str)  # trailing commas
-        json_str = json_str.replace('\\ n', '\\n')  # artifacts
-        json_str = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', ' ', json_str)  # control chars
-        json_str = re.sub(r'\\\\([a-zA-Z*(){}\\[\\]])', r'\\\\\1', json_str)  # LaTeX escapes \\\\cos -> \\\cos
+        cleaned = text.replace("```json", "").replace("```", "")
+        candidate = self._extract_last_json_array(cleaned)
 
-        # Attempt to robustly double-escape stray single backslashes inside JSON string literals
-        def _escape_backslashes_in_strings(s: str) -> str:
-            def _repl(m):
-                inner = m.group(1)
-                # Replace single backslashes that are not already doubled with double backslashes
-                inner_fixed = re.sub(r'(?<!\\\\)\\(?!\\\\)', r'\\\\', inner)
-                return '"' + inner_fixed + '"'
-            try:
-                return re.sub(r'"([^"\\]*(?:\\.[^"\\]*)*)"', _repl, s)
-            except re.error:
-                return s
+        (OUTPUT_DIR / "raw_extracted_pedagogue.json").write_text(
+            candidate or "", encoding="utf-8"
+        )
 
-        # Save cleaned (pre-escape)
-        cleaned_path = OUTPUT_DIR / "cleaned_pedagogue.json"
-        cleaned_path.write_text(json_str, encoding="utf-8")
+        if not candidate:
+            logging.error("Parsing failed: no valid JSON array found in response.")
+            return []
 
-        # Also create an escaped variant to help with parsing
-        escaped_variant = _escape_backslashes_in_strings(json_str)
+        repaired = candidate
 
-        # Parse attempts: try original, escaped, and single-quote-fixed variants
-        attempts = [json_str, escaped_variant, json_str.replace("'", '"'), escaped_variant.replace("'", '"')]
-        for i, attempt in enumerate(attempts):
-            try:
-                parsed = json.loads(attempt)
-                if isinstance(parsed, list) and len(parsed) > 0 and 'question' in parsed[0]:
-                    logging.info(f"JSON parsed successfully on attempt {i+1} ({len(parsed)} items)")
-                    return parsed
-            except json.JSONDecodeError as e:
-                logging.warning(f"Attempt {i+1} failed: {e}")
+        # 1) Normalize backslash + newline/carriage returns into literal "\\n".
+        # This fixes cases where the model emits an actual newline inside a JSON string,
+        # preceded by a backslash.
+        repaired = repaired.replace("\\\r\n", "\\\\n")
+        repaired = repaired.replace("\\\n", "\\\\n")
+        repaired = repaired.replace("\\\r", "\\\\n")
 
-        logging.error("Parsing failed. Check outputs/ files.")
-        return []
+        # 2) Sanitize invalid backslash escapes ("\\x", "\\(", "\\c", etc.).
+        # Valid JSON string escapes: \" , \\\ , \/ , \b , \f , \n , \r , \t , \uXXXX.
+        def _sanitize_invalid_json_escapes(s: str) -> str:
+            out: List[str] = []
+            i = 0
+            valid_after = {'"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u'}
+            n = len(s)
+            while i < n:
+                ch = s[i]
+                if ch == "\\" and i + 1 < n:
+                    nxt = s[i + 1]
+
+                    # Keep valid \uXXXX sequences
+                    if nxt == 'u':
+                        if i + 5 < n and all(c in '0123456789abcdefABCDEF' for c in s[i + 2 : i + 6]):
+                            out.append('\\u' + s[i + 2 : i + 6])
+                            i += 6
+                            continue
+
+                    if nxt in valid_after:
+                        out.append('\\' + nxt)
+                        i += 2
+                        continue
+
+                    # Invalid escape: escape the backslash itself.
+                    out.append('\\\\' + nxt)
+                    i += 2
+                    continue
+
+                out.append(ch)
+                i += 1
+
+            return ''.join(out)
+
+        repaired_sanitized = _sanitize_invalid_json_escapes(repaired)
+
+        try:
+            parsed = json.loads(repaired_sanitized)
+        except json.JSONDecodeError as e:
+            logging.error("Parsing failed: JSON decode error: %s", e)
+            (OUTPUT_DIR / "pedagogue_json_repair_failed.txt").write_text(
+                repaired_sanitized[:20000], encoding="utf-8"
+            )
+            return []
+
+        # Must be list of dicts
+        if not isinstance(parsed, list):
+            logging.error("Parsing failed: JSON is not a list/array.")
+            return []
+
+        if not parsed:
+            logging.warning("Parsing failed: JSON array is empty.")
+            return []
+
+        if not all(isinstance(x, dict) for x in parsed):
+            types = [type(x).__name__ for x in parsed[:5]]
+            logging.error(
+                "Parsing failed: array items are not objects. Item types (first 5): %s",
+                types,
+            )
+            return []
+
+        # Normalize fields
+        normalized: List[Dict[str, Any]] = []
+        for item in parsed:
+            q = dict(item)
+            if "explanation" not in q:
+                q["explanation"] = "No explanation provided."
+            if "question" not in q and "text" in q:
+                q["question"] = q["text"]
+            normalized.append(q)
+
+        (OUTPUT_DIR / "cleaned_pedagogue.json").write_text(
+            json.dumps(normalized, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+        return normalized
 
     def save_as_markdown(self, quiz_data: List[Dict[str, Any]], output_path: str) -> None:
         md_content = "# Generated Quiz\n\n"
+
         for i, q in enumerate(quiz_data, 1):
-            md_content += f"### Question {i}\\n{q['question']}\\n\\n"
-            for idx, opt in enumerate(q['options']):
+            if not isinstance(q, dict):
+                md_content += f"### Question {i}\nN/A\n\n"
+                continue
+
+            question = q.get("question", "N/A")
+            options = q.get("options", [])
+            answer = q.get("answer", "N/A")
+            explanation = q.get("explanation", "N/A")
+
+            md_content += f"### Question {i}\n{question}\n\n"
+
+            for idx, opt in enumerate(options if isinstance(options, list) else []):
                 label = chr(65 + idx)
-                clean_opt = re.sub(r'^([A-D][\\.])\\s*', '', str(opt)).strip()
-                md_content += f"- **{label}**) {clean_opt}\\n"
-            md_content += f"\\n> **Correct Answer:** {q['answer'].upper()}\\n"
-            md_content += f"> **Explanation:** {q.get('explanation', 'N/A')}\\n\\n---\\n\\n"
-        Path(output_path).write_text(md_content, encoding="utf-8")
+                clean_opt = re.sub(r"^([A-D][\.])\\s*", "", str(opt)).strip()
+                md_content += f"- **{label}**) {clean_opt}\n"
 
-    def generate_quiz(self, knowledge_bricks: str, output_path: Optional[str] = None) -> List[Dict[str, Any]]:
+            md_content += f"\n> **Correct Answer:** {str(answer).upper()}\n"
+            md_content += f"> **Explanation:** {explanation}\n\n---\n\n"
+
+        def _fix_tex_wrapping(s: str) -> str:
+            if not isinstance(s, str):
+                return s
+            if "\\\\" in s and "$" not in s:
+                return f"${s}$"
+            return s
+
+        md_content_fixed = re.sub(
+            r"(> \*\*Explanation:\*\* )(.*?)(\\n\\n---\\n)",
+            lambda m: m.group(1) + _fix_tex_wrapping(m.group(2)) + m.group(3),
+            md_content,
+            flags=re.DOTALL,
+        )
+        md_content_fixed = _fix_tex_wrapping(md_content_fixed)
+
+        md_content_fixed = clean_markdown_output(md_content_fixed)
+        Path(output_path).write_text(md_content_fixed, encoding="utf-8")
+
+    def generate_quiz(
+        self,
+        knowledge_bricks: str,
+        output_path: Optional[str] = None,
+        num_questions: int = 5,
+    ) -> List[Dict[str, Any]]:
         prompt = f"""[SYSTEM: PEDAGOGUE]
-Generate 5 MCQs from ONLY these knowledge bricks.
+Generate {num_questions} MCQs from ONLY these knowledge bricks.
 
-Strict rules:
-- 4 options per Q (A B C D), 1 correct.
-- LaTeX math ONLY.
-- Double escape backslashes: \\\\cos \\\\theta
-- NO chit-chat, markdown, codeblocks.
+Return ONLY a single JSON array (no extra text). No markdown, no code fences, no commentary.
 
-Knowledge:
+Each array item MUST be exactly this JSON object schema:
+{{
+  "question": "...",
+  "options": ["A) ...","B) ...","C) ...","D) ..."],
+  "answer": "A|B|C|D",
+  "explanation": "..."
+}}
+
+Rules:
+- Exactly 4 options per question.
+- Exactly one correct answer (letter A-D in "answer").
+- Use LaTeX for math ONLY.
+- Double escape backslashes in LaTeX: \\\\cos \\\\theta
+- Output must be valid JSON that can be parsed directly.
+
+KNOWLEDGE:
 {knowledge_bricks}
+"""
 
-VALID JSON ARRAY ONLY:
-[{{"question":"Q?", "options":["A) ","B) ","C) ","D) "], "answer":"A", "explanation":"..."}},{{"question":"..."}}]"""
-
-        logging.info(f"Running {self.model} to generate quiz...")
         if not self._check_ollama():
-            logging.error("Ollama is not running or accessible. Please start Ollama and ensure the model is available.")
+            logging.error(
+                "Ollama is not running or accessible. Please start Ollama and ensure the model is available."
+            )
             return []
 
-        # Request structured JSON where supported and use low temperature for determinism
         response = self._run_with_timeout(
             ollama.generate,
             model=self.model,
             prompt=prompt,
+            keep_alive=0,
+            options={"temperature": 0.1, "num_ctx": 2048, "num_gpu": 0},
             timeout=self.timeout,
         )
+
         if response is None:
             return []
 
-        raw_response = response['response']
+        raw_response = (
+            response.get("response", "")
+            if isinstance(response, dict)
+            else getattr(response, "response", "")
+        )
 
         OUTPUT_DIR = Path("outputs")
         OUTPUT_DIR.mkdir(exist_ok=True)
         (OUTPUT_DIR / "pedagogue_response.txt").write_text(raw_response, encoding="utf-8")
-        # Try parsing the response. If parsing fails, attempt a targeted "repair" generation
+
         quiz_data = self._parse_json(raw_response)
 
+        # One repair attempt: force JSON-only again
         if not quiz_data:
-            logging.info("Initial parse failed — attempting repair generation to force strict JSON output.")
             repair_prompt = (
-                "You will be given an arbitrary model output. Extract and return ONLY a valid JSON array that matches the schema:\n"
-                "[{\"question\":\"...\", \"options\":[\"A) ...\",\"B) ...\",\"C) ...\",\"D) ...\"], \"answer\":\"A\", \"explanation\":\"...\"}, ...]\n"
-                "If you cannot produce a valid array, return an empty array: []\n\nOUTPUT_TO_FIX:\n" + raw_response
+                "Return ONLY the JSON array of question objects. "
+                "Do not output any other text. "
+                "If you cannot, return [].\n\n"
+                "SCHEMA REMINDER: "
+                "[{\"question\":...,\"options\":[...4 items...],\"answer\":\"A\",\"explanation\":...}, ...]\n\n"
+                "ARBITRARY MODEL OUTPUT (extract JSON from it):\n"
+                + raw_response
             )
 
             repair_resp = self._run_with_timeout(
                 ollama.generate,
                 model=self.model,
                 prompt=repair_prompt,
+                keep_alive=0,
+                options={"temperature": 0.1, "num_ctx": 2048, "num_gpu": 0},
                 timeout=min(60, self.timeout),
             )
 
             if repair_resp is not None:
-                repaired = repair_resp.get('response', '')
+                repaired = (
+                    repair_resp.get("response", "")
+                    if isinstance(repair_resp, dict)
+                    else getattr(repair_resp, "response", "")
+                )
                 (OUTPUT_DIR / "pedagogue_response_repair.txt").write_text(repaired, encoding="utf-8")
                 quiz_data = self._parse_json(repaired)
 
-        # As a last resort, call Ollama HTTP API directly with format=json to force strict JSON
-        if not quiz_data:
-            try:
-                import requests
-                logging.info("Attempting HTTP fallback to Ollama /api/generate with format=json")
-                http_payload = {"model": self.model, "prompt": prompt, "format": "json"}
-                r = requests.post("http://127.0.0.1:11434/api/generate", json=http_payload, timeout=min(60, self.timeout))
-                if r.ok:
-                    raw_text = r.text
-                    # Ollama HTTP may stream chunks as JSON lines with a 'response' field.
-                    # If so, assemble the 'response' parts; otherwise use the full text.
-                    assembled = []
-                    for line in raw_text.splitlines():
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            part = json.loads(line)
-                            if isinstance(part, dict) and 'response' in part:
-                                assembled.append(str(part.get('response', '')))
-                            else:
-                                assembled.append(line)
-                        except Exception:
-                            assembled.append(line)
-
-                    http_response_text = "".join(assembled) if assembled else raw_text
-                    (OUTPUT_DIR / "pedagogue_response_http.txt").write_text(http_response_text, encoding="utf-8")
-                    quiz_data = self._parse_json(http_response_text)
-            except Exception as e:
-                logging.warning(f"HTTP fallback failed: {e}")
+        if quiz_data and len(quiz_data) > num_questions:
+            quiz_data = quiz_data[:num_questions]
 
         if quiz_data and output_path:
             self.save_as_markdown(quiz_data, output_path)
