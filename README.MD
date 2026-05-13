@@ -1,275 +1,111 @@
-# 🎯 Multi-Agent AI Quiz Generator
+# Multi-Agent AI Quiz Generator
 
-## 📌 Overview
-A **local-first, multi-agent AI system** that converts academic lecture slides (PDFs) into **high-quality, validated quizzes**.
+## Overview
+A local-first, multi-agent system that converts academic lecture PDFs into high-quality, validated quizzes.
 
-Designed for students and educators, the system runs entirely on **consumer hardware** (optimized for 4GB VRAM GPUs), ensuring:
-- 🔒 Full data privacy (no external APIs)
-- 💰 Zero inference cost
-- ⚡ Efficient on-device performance
+The system is designed to run on consumer hardware (optimized for approximately 4GB VRAM GPUs) and avoids external APIs.
 
----
+## Core idea
+Instead of relying on a single model, the project uses a modular multi-agent architecture where each agent specializes in a specific cognitive task. This improves answer reliability and helps reduce hallucinations.
 
-## 🧠 Core Idea
+## Pipeline
+1. Extraction: Converts lecture slides (PDF) into structured Markdown.
+2. Curator: Extracts key concepts ("knowledge bricks") and filters irrelevant content.
+3. Pedagogue: Generates quiz questions (multiple-choice) using a pedagogical approach.
+4. Adversary: Validates questions against the extracted source material.
+5. Explainer: Produces detailed explanations for the correct answers.
 
-Instead of relying on a single large model, this project adopts a **modular multi-agent architecture** where each agent specializes in a specific cognitive task.
+## Repository layout
+- main.py: Entry point.
+- backend/: Agent implementations.
+- outputs/: Generated artifacts and debug outputs.
+- config.ini: Model configuration.
+- requirements.txt: Python dependencies.
 
-This design:
-- Reduces hallucination
-- Improves answer reliability
-- Enables fine-grained debugging and optimization
+## Requirements
+- Python 3.12+
+- Ollama installed and running locally
+- (Recommended) NVIDIA GPU with sufficient VRAM
 
----
-
-## 🏗️ Architecture
-
-### 🔁 Sequential Relay Orchestration
-
-The system processes data through a pipeline of specialized agents:
-
----
-
-## ⚙️ Pipeline Flow
-
-### 1. 📄 Extraction
-- Converts lecture slides (PDF) into structured Markdown
-- Preserves layout (headers, tables, sections)
-
-### 2. 🧩 Analysis — *Curator*
-- Extracts key concepts (\"Knowledge Bricks\")
-- Filters noise and irrelevant content
-
-### 3. ✍️ Generation — *Pedagogue*
-- Generates multiple-choice questions
-- Applies Bloom’s Taxonomy for deeper understanding
-- Creates realistic distractors
-
-### 4. 🛡️ Validation — *Adversary*
-- Cross-checks questions against source material
-- Detects hallucinations and logical inconsistencies
-
-### 5. 📚 Explanation — *Explainer*
-- Produces detailed answer explanations
-- Enhances learning and retention
-
----
-
-## 🤖 Agent Stack
-
-| Agent | Model | Responsibility | Approx. VRAM |
-|------|------|----------------|-------------|
-| **Curator** | `qwen3:1.7b` | Knowledge extraction | ~1.1 GB |
-| **Pedagogue** | `llama3.2:3b` | Question generation | ~1.8 GB |
-| **Adversary** | `llama3.2:3b` | Fact-checking & validation | ~1.8 GB |
-| **Explainer** | `llama3.2:3b` | Answer explanation | ~1.8 GB |
-
-> ⚠️ Models are loaded sequentially to stay within 4GB VRAM constraints.
-
----
-
-## 🛠️ Technical Details
-
-### 📄 PDF → Markdown Extraction
-
-We use layout-aware parsing to maintain document structure:
-
-```python
-import pymupdf4llm
-from pathlib import Path
-
-def extract_pdf_to_md(path):
-    content = pymupdf4llm.to_markdown(path)
-    Path(\"extracted_lecture.md\").write_text(content, encoding=\"utf-8\")
-    return content
-```
-
----
-
-## 🚀 Quick Start Guide
-
-Follow these step-by-step instructions to set up and run QuizGenApp.
-
-### Prerequisites
-- **Python 3.12+** (check with `python --version`)
-- **NVIDIA GPU with ≥4GB VRAM** (recommended for speed)
-- **Ollama** (for AI model inference)
-
----
-
-### Step 1: Install Ollama (AI Models)
-1. Download Ollama from [https://ollama.com/download](https://ollama.com/download)
-2. Install and run Ollama
-3. Pull required models:
+## Install and run
+### 1) Install and run Ollama
+1. Install Ollama: https://ollama.com/download
+2. Start the Ollama server (keep it running):
+   - On Windows you can run it from the Ollama app, or via the CLI if you prefer.
+3. Pull required models (adjust as needed):
    ```bash
    ollama pull qwen3:1.7b
    ollama pull phi4-mini:latest
+   ollama pull gemma3:4b
+   ollama pull llama3.2:1b
    ```
-4. Verify installation:
+4. Verify:
    ```bash
    ollama list
-   ollama serve  # Start Ollama server (keep running in background)
    ```
 
----
+### 2) Set up Python
+From this project directory:
+```bash
+python -m venv .venv
+```
+Activate:
+- Windows PowerShell:
+  ```powershell
+  .venv\Scripts\Activate.ps1
+  ```
 
-### Step 2: Set Up Python Environment
-1. Clone or download the project
-2. Navigate to project directory:
-   ```bash
-   cd path/to/QuizGenApp
-   ```
-3. Create virtual environment:
-   ```bash
-   python -m venv .venv
-   ```
-4. Activate virtual environment:
-   ```powershell
-   # Windows PowerShell
-   .venv\Scripts\Activate.ps1
-   ```
-   ```bash
-   # Linux/Mac
-   source .venv/bin/activate
-   ```
+- Linux/macOS:
+  ```bash
+  source .venv/bin/activate
+  ```
 
----
-
-### Step 3: Install Python Dependencies
+Install dependencies:
 ```bash
 pip install -r requirements.txt
 ```
 
----
+### 3) Prepare your PDF
+Place a lecture PDF in the project directory (the directory where main.py is located).
 
-### Step 4: Enable GPU Acceleration (Optional but Recommended)
-GPU acceleration speeds up PDF processing and AI generation significantly.
+Important: the app processes the first PDF it finds in the current directory matching `*.pdf`.
 
-#### For PDF Extraction (PyTorch CUDA):
-```bash
-# Remove CPU-only PyTorch
-pip uninstall torch torchvision torchaudio -y
+Example: `Chapter 2. Transformation.pdf`
 
-# Install CUDA-enabled PyTorch (CUDA 12.1)
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-```
-
-#### Verify GPU Setup:
-```bash
-# Check PyTorch CUDA
-python -c "import torch; print('PyTorch CUDA available:', torch.cuda.is_available())"
-
-# Check NVIDIA GPU
-nvidia-smi
-```
-
-**Note:** You may see dependency conflicts with `marker-pdf` requiring torch>=2.7.0, but torch 2.5.1+cu121 works correctly. These warnings are safe to ignore.
-
-#### For Ollama GPU (Automatic):
-Ollama automatically uses GPU if:
-- NVIDIA drivers are installed
-- CUDA is available
-- GPU has sufficient VRAM
-
-Verify with:
-```bash
-ollama ps  # Shows GPU usage
-```
-
-**Note:** If GPU setup fails, the app will run on CPU (slower but functional).
-
----
-
-### Step 5: Prepare Your PDF
-1. Place your lecture PDF file in the project root directory
-   - Example: `Chapter 2. Transformation.pdf`
-2. Ensure the PDF contains academic content (equations, text, etc.)
-
----
-
-### Step 6: Run the Application
+### 4) Run
+Default mode (accuracy):
 ```bash
 python main.py
 ```
-
-**Expected Output:**
-```
-2026-04-28 XX:XX:XX - INFO - Processing Chapter 2. Transformation.pdf
-2026-04-28 XX:XX:XX - INFO - GPU detected and will be used for PDF extraction.
-2026-04-28 XX:XX:XX - INFO - Ollama GPU status: Ollama running (GPU support depends on installation)
-...processing logs...
-2026-04-28 XX:XX:XX - INFO - Quiz saved to Generated_Quiz.md
-```
-
----
-
-### Step 7: View Results
-- **Quiz file**: `Generated_Quiz.md` (in project root)
-- **Debug files** (in `outputs/` folder):
-  - `knowledge_bricks.md` (extracted concepts)
-  - `pedagogue_response.txt` (raw AI response)
-  - `raw_extracted_pedagogue.json` (parsed quiz data)
-
----
-
-## 📋 Alternative: Automated GPU Setup
-Run the provided setup script:
-```powershell
-.\setup_gpu.ps1
-```
-
-This script handles PyTorch CUDA installation and provides Ollama GPU instructions.
-```
-
-
-### 2. Confirm Ollama Models (already pulled)
-```
-qwen3:1.7b     ✓
-phi4-mini      ✓
-gemma3:4b      ✓
-llama3.2:1b    ✓
-```
+Fast mode (skips precision extraction):
 ```bash
-ollama list  # Verify
+python main.py --mode fast
 ```
-
-### 3. Run
-Place PDF in project root (e.g., `Chapter 2. Transfomation.pdf`), then:
+Choose number of questions (default is 30 if not provided):
 ```bash
-python main.py
+python main.py --mode fast --num 20
 ```
 
-**Output:** `Generated_Quiz.md` in project root.
+## Outputs
+- outputs/Generated_Quiz.md: Final quiz with explanations.
+- outputs/: Additional debug artifacts are written by the backend components.
 
----
+## Configuration
+Models are controlled by config.ini:
+- curator_model
+- pedagogue_model
+- adversary_model
+- explainer_model
 
-## 📋 Usage
+If you want to use different Ollama models, update config.ini accordingly.
 
-**Simple:**
-1. Drop PDF file(s) in `d:/Code/QuizGenApp/`
-2. `python main.py`
-3. Check `Generated_Quiz.md`
+## Troubleshooting
+- No PDF found: ensure there is at least one `*.pdf` in the project directory.
+- Ollama/model errors: confirm Ollama is running and models exist with `ollama list`.
+- Performance issues: use `--mode fast` and/or ensure your GPU/VRAM are sufficient.
 
-**Notes:**
-- Processes **first** PDF found in current directory
-- Debug files: `knowledge_bricks.md`, `pedagogue_response.txt`
-- Ensure `ollama serve` running in background
-
----
-
-## 🧪 Troubleshooting
-
-1. **No PDF found**: Place lecture PDF in project directory
-2. **Ollama errors**: `ollama serve` + check models with `ollama list`
-3. **VRAM issues**: Models load one-by-one automatically
-4. **Extraction fails**: `pip install --upgrade pymupdf4llm marker-pdf`
-5. **PDFExtractor using CPU?** Run GPU setup above + verify `torch.cuda.is_available()`. Check `nvidia-smi`.
-
-## 📈 Next Steps
-- [ ] Add CLI args (e.g., --pdf path)
-- [ ] Streamlit UI
-- [ ] OCR for image slides
-- [ ] Export to Anki
-
----
-*Built with ❤️ for academic excellence*
+## Development notes (for contributors)
+- main.py is the only entry point required to generate a quiz.
+- The pipeline order is Extraction -> Curator -> Pedagogue -> Adversary -> Explainer.
+- The app writes final results only after the Explainer phase.
 
