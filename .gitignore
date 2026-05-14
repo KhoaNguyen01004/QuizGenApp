@@ -80,3 +80,4 @@ Desktop.ini
 # others
 TODO.md
 outputs/
+venv_gpu/
