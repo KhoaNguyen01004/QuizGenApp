@@ -2,3 +2,6 @@ pymupdf4llm
 marker-pdf
 ollama
 requests
+fastapi
+uvicorn
+python-multipart

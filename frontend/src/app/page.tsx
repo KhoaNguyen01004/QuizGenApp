@@ -24,6 +24,12 @@ export default function Home() {
           const status = await api.getStatus(store.jobId!);
           store.updateStatus(status.stage, status.progress, status.logs);
           
+          if (status.stage?.toLowerCase() === 'error') {
+            store.setError(status.logs[status.logs.length - 1] || "An error occurred during generation");
+            clearInterval(pollIntervalRef.current!);
+            return;
+          }
+
           if (status.progress >= 100 || status.stage?.toLowerCase() === 'complete') {
             clearInterval(pollIntervalRef.current!);
             fetchResult(store.jobId!);
@@ -45,7 +51,7 @@ export default function Home() {
   const fetchResult = async (jobId: string) => {
     try {
       const result = await api.getResult(jobId);
-      store.setResult(result.markdown);
+      store.setResult(result.markdown, result.quiz);
       toast.success("Quiz generated successfully!");
     } catch (error) {
       console.error(error);
@@ -62,7 +68,7 @@ export default function Home() {
 
     try {
       store.reset();
-      store.setJobId("temp-id");
+      store.setIsProcessing(true);
       const response = await api.generateQuiz(file, mode, numQs);
       store.setJobId(response.job_id);
       toast.success("Generation started!");
@@ -118,7 +124,7 @@ export default function Home() {
 
             {store.markdown && (
               <div className="h-[calc(100vh-8rem)] print:h-auto print:block">
-                <QuizViewer markdown={store.markdown} />
+                <QuizViewer markdown={store.markdown} quiz={store.quiz || undefined} />
               </div>
             )}
           </div>

@@ -132,11 +132,13 @@ async def _process_quiz(job_id: str, file_path: str, mode: str, num_questions: i
         
         OUTPUT_DIR = base_path / "outputs"
         OUTPUT_DIR.mkdir(exist_ok=True)
-        final_md_path = OUTPUT_DIR / f"{job_id}.md"
+        final_md_path = OUTPUT_DIR / "Generate_Quiz.md"
         teacher.save_as_markdown(final_quiz, str(final_md_path))
         
         with open(final_md_path, "r", encoding="utf-8") as f:
             jobs[job_id]["result_markdown"] = f.read()
+        
+        jobs[job_id]["quiz"] = final_quiz
 
         log("Generation finished successfully.")
 
@@ -195,7 +197,10 @@ async def get_result(job_id: str):
     if jobs[job_id]["result_markdown"] is None:
         raise HTTPException(status_code=400, detail="Result not ready yet")
         
-    return {"markdown": jobs[job_id]["result_markdown"]}
+    return {
+        "markdown": jobs[job_id]["result_markdown"],
+        "quiz": jobs[job_id].get("quiz", [])
+    }
 
 if __name__ == "__main__":
     import uvicorn

@@ -71,7 +71,13 @@ Format as clean Markdown bullet list:
 - Concept 1: definition/formula
 - Concept 2: ...
 
-Use LaTeX for math. Match source language. No fluff.
+IMPORTANT LATEX AND FORMAT RULES:
+- LATEX SAFETY RULES: Use ONLY valid KaTeX commands. NEVER invent, truncate, or hallucinate LaTeX commands (e.g., NO \\ullet, \\ext, \\heta). ONLY use standard operators like \\cdot, \\sin, \\cos, \\theta, \\frac, ^{{}}, _{{}}. 
+- Use KaTeX-compatible LaTeX for math, wrap inline math with $...$, and keep on a SINGLE LINE.
+- DO NOT break down equations into multiple lines (NO OCR-style formatting).
+- Double escape backslashes in LaTeX: e.g. $\\\\cos(\\\\theta)$. If unsure, output plain text instead of broken LaTeX!
+- DO NOT use emojis or decorative unicode symbols.
+- Match source language. No fluff.
 
 SOURCE:
 {source}
