@@ -1,10 +1,11 @@
 import { create } from 'zustand';
-import { JobState } from '../types';
+import { JobState, QuizQuestion } from '../types';
 
 interface StoreState extends JobState {
   setJobId: (id: string) => void;
+  setIsProcessing: (isProcessing: boolean) => void;
   updateStatus: (stage: string, progress: number, logs: string[]) => void;
-  setResult: (markdown: string) => void;
+  setResult: (markdown: string, quiz?: QuizQuestion[]) => void;
   setError: (error: string) => void;
   reset: () => void;
 }
@@ -15,6 +16,7 @@ const initialState: JobState = {
   progress: 0,
   logs: [],
   markdown: null,
+  quiz: null,
   isProcessing: false,
   error: null,
 };
@@ -24,9 +26,11 @@ export const useStore = create<StoreState>((set) => ({
   
   setJobId: (id) => set({ jobId: id, isProcessing: true, error: null }),
   
+  setIsProcessing: (isProcessing) => set({ isProcessing, error: null }),
+  
   updateStatus: (stage, progress, logs) => set({ stage, progress, logs }),
   
-  setResult: (markdown) => set({ markdown, isProcessing: false, progress: 100 }),
+  setResult: (markdown, quiz) => set({ markdown, quiz, isProcessing: false, progress: 100 }),
   
   setError: (error) => set({ error, isProcessing: false }),
   

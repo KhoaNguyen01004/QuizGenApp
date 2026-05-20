@@ -127,4 +127,4 @@
   html {
     @apply font-sans;
   }
-}
+}@import "katex/dist/katex.min.css";

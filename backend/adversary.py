@@ -178,10 +178,15 @@ If the current answer letter is unsupported or contradicts the Knowledge Bricks,
 Return ONLY valid JSON with this schema:
 {{"flagged": true/false, "best_answer": "A"/"B"/"C"/"D", "notes": "..."}}
 
-Rules:
+IMPORTANT LATEX AND FORMAT RULES:
 - Use the Knowledge Bricks as ground truth.
 - If none of the options are supported, set flagged=true and best_answer to the closest supported option (or keep original if equally unsupported).
-- Do not include any extra text.
+- Return ONLY valid JSON that can be parsed by JSON.parse() (NO markdown code blocks, NO extra text).
+- LATEX SAFETY RULES: Use ONLY valid KaTeX commands. NEVER invent, truncate, or hallucinate LaTeX commands (e.g., NO \\ullet, \\ext, \\heta). ONLY use standard operators like \\cdot, \\sin, \\cos, \\theta, \\frac, ^{{}}, _{{}}. 
+- All mathematical expressions MUST use KaTeX-compatible LaTeX, wrap inline math with $...$, and be on a SINGLE LINE.
+- DO NOT break down equations into multiple lines (NO OCR-style formatting).
+- Notes text must be clean, markdown-safe, without random line breaks or decorative emojis.
+
 
 Knowledge Bricks:
 {knowledge_bricks}

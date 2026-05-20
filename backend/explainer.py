@@ -112,13 +112,14 @@ class ExplainerAgent:
 Using ONLY the Knowledge Bricks, write an explanation for the following MCQ.
 You MUST produce exactly 2 sentences.
 
-LaTeX constraint:
-- Any math symbols, formulas, vectors, or matrices MUST be wrapped in $...$.
-- Any LaTeX command MUST use double backslashes (\\) inside the explanation (e.g., \\cos, \\theta).
-- Do not use Markdown.
-
-Return ONLY valid JSON:
-{{"explanation": "..."}}
+IMPORTANT LATEX AND FORMAT RULES:
+- Return ONLY valid JSON: {{"explanation": "..."}} (NO markdown code blocks, NO extra text).
+- LATEX SAFETY RULES: Use ONLY valid KaTeX commands. NEVER invent, truncate, or hallucinate LaTeX commands (e.g., NO \\ullet, \\ext, \\heta). ONLY use standard operators like \\cdot, \\sin, \\cos, \\theta, \\frac, ^{{}}, _{{}}. 
+- All mathematical expressions MUST use KaTeX-compatible LaTeX, wrap inline math with $...$, and be on a SINGLE LINE.
+- Any LaTeX command MUST use double backslashes (\\) inside the explanation (e.g., \\\\cos, \\\\theta). If unsure, output plain text instead!
+- DO NOT break down equations into multiple lines (NO OCR-style formatting).
+- DO NOT use emojis or decorative unicode symbols (e.g. ✀ ✦ ✨ ✔ ❌ ➜ ◆ ● ■ ★).
+- The explanation must be clean, markdown-safe, and without random line breaks.
 
 Knowledge Bricks:
 {knowledge_bricks}

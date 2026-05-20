@@ -258,18 +258,30 @@ Return ONLY a single JSON array (no extra text). No markdown, no code fences, no
 
 Each array item MUST be exactly this JSON object schema:
 {{
+  "id": 1,
   "question": "...",
-  "options": ["A) ...","B) ...","C) ...","D) ..."],
-  "answer": "A|B|C|D",
-  "explanation": "..."
+  "options": ["...","...","...","..."],
+  "correct_answer": 0,
+  "answer": "A",
+  "explanation": "...",
+  "difficulty": "easy",
+  "topic": "..."
 }}
 
 Rules:
-- Exactly 4 options per question.
-- Exactly one correct answer (letter A-D in "answer").
-- Use LaTeX for math ONLY.
-- Double escape backslashes in LaTeX: \\\\cos \\\\theta
-- Output must be valid JSON that can be parsed directly.
+- Exactly 4 options per question. Do NOT include A), B), C), D) prefixes inside the option string.
+- "id": an integer sequence starting from 1.
+- "correct_answer": an integer index (0-3) corresponding to the correct option in "options".
+- "answer": the letter A, B, C, or D for the correct answer.
+- "difficulty": string (e.g., "easy", "medium", "hard").
+- "topic": string, general topic.
+- Return ONLY valid JSON array that can be parsed by JSON.parse(). NO extra text, NO markdown code blocks.
+- LATEX SAFETY RULES: Use ONLY valid KaTeX commands. NEVER invent, truncate, or hallucinate LaTeX commands (e.g., NO \\ullet, \\ext, \\heta). ONLY use standard operators like \\cdot, \\sin, \\cos, \\theta, \\frac, ^{{}}, _{{}}. 
+- All mathematical expressions MUST use KaTeX-compatible LaTeX, wrap inline math with $...$, and be on a SINGLE LINE.
+- Double escape backslashes in LaTeX: e.g. $\\\\cos(\\\\theta)$. If unsure, output plain text instead of broken LaTeX!
+- DO NOT break down equations into multiple lines (NO OCR-style formatting).
+- DO NOT use emojis or decorative unicode symbols (e.g. ✀ ✦ ✨ ✔ ❌ ➜ ◆ ● ■ ★).
+- Question, options, and explanation text must be clean, markdown-safe, and without random line breaks.
 
 KNOWLEDGE:
 {knowledge_bricks}
@@ -309,10 +321,11 @@ KNOWLEDGE:
         if not quiz_data:
             repair_prompt = (
                 "Return ONLY the JSON array of question objects. "
-                "Do not output any other text. "
+                "Do not output any other text or markdown block. "
+                "Ensure all latex math is single-line, uses $...$ wrappers, and no bad unicode/OCR format. "
                 "If you cannot, return [].\n\n"
                 "SCHEMA REMINDER: "
-                "[{\"question\":...,\"options\":[...4 items...],\"answer\":\"A\",\"explanation\":...}, ...]\n\n"
+                "[{\"id\":1,\"question\":...,\"options\":[...4 items...],\"correct_answer\":0,\"answer\":\"A\",\"explanation\":...,\"difficulty\":\"...\",\"topic\":\"...\"}, ...]\n\n"
                 "ARBITRARY MODEL OUTPUT (extract JSON from it):\n"
                 + raw_response
             )
