@@ -227,6 +227,34 @@ Current answer: {self._extract_letter_answer(str(q.get('answer', '')))}
 
                 # Extract JSON object if needed
                 raw_clean = raw.strip()
+                
+                def _sanitize_invalid_json_escapes(s: str) -> str:
+                    out: List[str] = []
+                    i = 0
+                    valid_after = {'"', '\\', '/', 'n', 'r', 'u'}
+                    n = len(s)
+                    while i < n:
+                        ch = s[i]
+                        if ch == "\\" and i + 1 < n:
+                            nxt = s[i + 1]
+                            if nxt == 'u':
+                                if i + 5 < n and all(c in '0123456789abcdefABCDEF' for c in s[i + 2 : i + 6]):
+                                    out.append('\\u' + s[i + 2 : i + 6])
+                                    i += 6
+                                    continue
+                            if nxt in valid_after:
+                                out.append('\\' + nxt)
+                                i += 2
+                                continue
+                            out.append('\\\\' + nxt)
+                            i += 2
+                            continue
+                        out.append(ch)
+                        i += 1
+                    return ''.join(out)
+
+                raw_clean = _sanitize_invalid_json_escapes(raw_clean)
+                
                 try:
                     parsed = json.loads(raw_clean)
                 except Exception:

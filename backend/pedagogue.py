@@ -131,7 +131,8 @@ class PedagogueAgent:
         def _sanitize_invalid_json_escapes(s: str) -> str:
             out: List[str] = []
             i = 0
-            valid_after = {'"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u'}
+            # Remove 'b', 'f', 't' from valid_after to avoid parsing \begin, \frac, \times as invisible control characters.
+            valid_after = {'"', '\\', '/', 'n', 'r', 'u'}
             n = len(s)
             while i < n:
                 ch = s[i]
@@ -196,6 +197,27 @@ class PedagogueAgent:
                 q["explanation"] = "No explanation provided."
             if "question" not in q and "text" in q:
                 q["question"] = q["text"]
+                
+            # Validate correct answer mapping
+            options_list = q.get("options", [])
+            num_options = len(options_list) if isinstance(options_list, list) else 0
+            
+            # Map correct_answer <-> answer properly to avoid mismatch
+            if "correct_answer" in q and isinstance(q["correct_answer"], int) and 0 <= q["correct_answer"] < num_options:
+                q["answer"] = chr(65 + q["correct_answer"])
+            elif "answer" in q and isinstance(q["answer"], str) and len(q["answer"]) > 0 and q["answer"][0].upper() in ['A', 'B', 'C', 'D']:
+                ans_char = q["answer"][0].upper()
+                q["answer"] = ans_char
+                idx = ord(ans_char) - 65
+                if idx < num_options:
+                    q["correct_answer"] = idx
+                else:
+                    q["correct_answer"] = 0
+                    q["answer"] = "A"
+            else:
+                q["correct_answer"] = 0
+                q["answer"] = "A"
+                
             normalized.append(q)
 
         (OUTPUT_DIR / "cleaned_pedagogue.json").write_text(
@@ -222,20 +244,23 @@ class PedagogueAgent:
             for idx, opt in enumerate(options if isinstance(options, list) else []):
                 label = chr(65 + idx)
                 clean_opt = re.sub(r"^([A-D][\.])\\s*", "", str(opt)).strip()
-                md_content += f"- **{label}**) {clean_opt}\n"
+                md_content += f"- **{label}**) {clean_opt}\n\n"
 
             md_content += f"\n> **Correct Answer:** {str(answer).upper()}\n"
-            md_content += f"> **Explanation:** {explanation}\n\n---\n\n"
+            
+            # format explanation properly inside blockquotes
+            explanation_formatted = "\n> ".join(explanation.replace('\r\n', '\n').split('\n'))
+            md_content += f"> **Explanation:** {explanation_formatted}\n\n---\n\n"
 
         def _fix_tex_wrapping(s: str) -> str:
             if not isinstance(s, str):
                 return s
-            if "\\\\" in s and "$" not in s:
+            if "\\" in s and "$" not in s and any(c in s for c in ['frac', 'cos', 'sin', 'theta', 'mathbf', 'alpha']):
                 return f"${s}$"
             return s
 
         md_content_fixed = re.sub(
-            r"(> \*\*Explanation:\*\* )(.*?)(\\n\\n---\\n)",
+            r"(> \*\*Explanation:\*\* )(.*?)(\n\n---\n)",
             lambda m: m.group(1) + _fix_tex_wrapping(m.group(2)) + m.group(3),
             md_content,
             flags=re.DOTALL,
@@ -279,9 +304,10 @@ Rules:
 - LATEX SAFETY RULES: Use ONLY valid KaTeX commands. NEVER invent, truncate, or hallucinate LaTeX commands (e.g., NO \\ullet, \\ext, \\heta). ONLY use standard operators like \\cdot, \\sin, \\cos, \\theta, \\frac, ^{{}}, _{{}}. 
 - All mathematical expressions MUST use KaTeX-compatible LaTeX, wrap inline math with $...$, and be on a SINGLE LINE.
 - Double escape backslashes in LaTeX: e.g. $\\\\cos(\\\\theta)$. If unsure, output plain text instead of broken LaTeX!
+- Text inside LaTeX (like \\\\text{...}) MUST contain proper spaces. Do NOT merge words together.
 - DO NOT break down equations into multiple lines (NO OCR-style formatting).
 - DO NOT use emojis or decorative unicode symbols (e.g. ✀ ✦ ✨ ✔ ❌ ➜ ◆ ● ■ ★).
-- Question, options, and explanation text must be clean, markdown-safe, and without random line breaks.
+- Question, options, and explanation text must be readable, markdown-safe, and use proper spacing.
 
 KNOWLEDGE:
 {knowledge_bricks}
