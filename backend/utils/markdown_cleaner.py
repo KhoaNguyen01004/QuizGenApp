@@ -51,7 +51,8 @@ def clean_markdown_output(text: str) -> str:
 
     # Also handle cases where generator outputs "\\mathbf{ v }" with odd spaces.
     cleaned = re.sub(r"\\mathbf\s*\{\s*", r"\\mathbf{", cleaned)
-    cleaned = re.sub(r"\s*\}", r"}", cleaned)
+    # Only remove space before closing brace if it's right after a single character (like \mathbf{v })
+    cleaned = re.sub(r"(\\mathbf{[A-Za-z0-9])\s*\}", r"\1}", cleaned)
 
     # --- 3) Fix common broken math wrappers / missing braces ---
     cleaned = re.sub(r"\$\s+", r"$", cleaned)
