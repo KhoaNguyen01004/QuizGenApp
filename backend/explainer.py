@@ -21,9 +21,10 @@ class ExplainerAgent:
     - use double backslashes (\\) for LaTeX commands
     """
 
-    def __init__(self, model: str = "llama3.2:3b", timeout: int = 180):
+    def __init__(self, model: str = "llama3.2:3b", timeout: int = 600, use_gpu: bool = True):
         self.model = model
         self.timeout = timeout
+        self.use_gpu = use_gpu
         self._log_gpu_status()
 
     def _log_gpu_status(self):
@@ -43,7 +44,7 @@ class ExplainerAgent:
         except Exception as e:
             logging.warning(f"Could not check Ollama GPU status: {e}")
 
-    def _run_with_timeout(self, fn, *args, timeout: int = 180, **kwargs):
+    def _run_with_timeout(self, fn, *args, timeout: int = 600, **kwargs):
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(fn, *args, **kwargs)
             try:
@@ -89,6 +90,8 @@ class ExplainerAgent:
         OUTPUT_DIR.mkdir(exist_ok=True)
 
         validated = []
+        num_gpu = -1 if self.use_gpu else 0  # GPU acceleration enabled
+        
         for idx, q in enumerate(quiz_data):
             if not isinstance(q, dict):
                 continue
@@ -110,7 +113,7 @@ You MUST produce exactly 2 sentences.
 
 IMPORTANT LATEX AND FORMAT RULES:
 - Return ONLY valid JSON: {{"explanation": "..."}} (NO markdown code blocks, NO extra text).
-- LATEX SAFETY RULES: Use ONLY valid KaTeX commands. NEVER invent, truncate, or hallucinate LaTeX commands (e.g., NO \\ullet, \\ext, \\heta). ONLY use standard operators like \\cdot, \\sin, \\cos, \\theta, \\frac, ^{{}}, _{{}}. 
+- LATEX SAFETY RULES: Use ONLY valid KaTeX commands. NEVER invent, truncate, or hallucinate LaTeX commands (e.g., NO \\ullet, \\ext, \\heta). ONLY use standard operators like \\cdot, \\sin, \\cos, \\theta, \\frac, etc.
 - All mathematical expressions MUST use KaTeX-compatible LaTeX, wrap inline math with $...$, and be on a SINGLE LINE.
 - Any LaTeX command MUST use double backslashes (\\) inside the explanation (e.g., \\\\cos, \\\\theta). If unsure, output plain text instead!
 - Text inside LaTeX (like \\\\text{...}) MUST contain proper spaces. Do NOT merge words together.
@@ -136,7 +139,7 @@ Correct Answer:
                 ollama.generate,
                 model=self.model,
                 prompt=prompt,
-                options={"num_ctx": 4096},
+                options={"num_ctx": 4096, "num_gpu": num_gpu},
                 format="json",
                 timeout=self.timeout,
             )
@@ -203,4 +206,3 @@ Correct Answer:
             Path(output_path).write_text(json.dumps(validated, ensure_ascii=False, indent=2), encoding="utf-8")
 
         return validated
-
