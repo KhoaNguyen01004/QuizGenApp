@@ -10,9 +10,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 
 class CuratorAgent:
-    def __init__(self, model: str = "qwen3:1.7b", timeout: int = 180):
+    def __init__(self, model: str = "qwen3:1.7b", timeout: int = 600, use_gpu: bool = True):
         self.model = model
         self.timeout = timeout
+        self.use_gpu = use_gpu
         self._log_gpu_status()
 
     def _log_gpu_status(self):
@@ -33,7 +34,7 @@ class CuratorAgent:
         except Exception as e:
             logging.warning(f"Could not check Ollama GPU status: {e}")
 
-    def _run_with_timeout(self, fn, *args, timeout: int = 180, **kwargs):
+    def _run_with_timeout(self, fn, *args, timeout: int = 600, **kwargs):
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(fn, *args, **kwargs)
             try:
@@ -57,8 +58,8 @@ class CuratorAgent:
         """Extract key concepts as structured 'Knowledge Bricks' MD.
 
         Robustness:
-        - The initial extraction can time out on long PDFs.
-        - If the primary attempt fails, fall back to chunk-based extraction + merge.
+        - Try full extraction first with GPU acceleration.
+        - If initial extraction fails or times out, fall back to chunk-based extraction.
         """
 
         def _build_prompt(source: str) -> str:
@@ -72,7 +73,7 @@ Format as clean Markdown bullet list:
 - Concept 2: ...
 
 IMPORTANT LATEX AND FORMAT RULES:
-- LATEX SAFETY RULES: Use ONLY valid KaTeX commands. NEVER invent, truncate, or hallucinate LaTeX commands (e.g., NO \\ullet, \\ext, \\heta). ONLY use standard operators like \\cdot, \\sin, \\cos, \\theta, \\frac, ^{{}}, _{{}}. 
+- LATEX SAFETY RULES: Use ONLY valid KaTeX commands. NEVER invent, truncate, or hallucinate LaTeX commands (e.g., NO \\ullet, \\ext, \\heta). ONLY use standard operators like \\cdot, \\sin, \\cos, \\theta, \\frac, ^{{}}, _{{}}.
 - Use KaTeX-compatible LaTeX for math, wrap inline math with $...$, and keep on a SINGLE LINE.
 - DO NOT break down equations into multiple lines (NO OCR-style formatting).
 - Double escape backslashes in LaTeX: e.g. $\\\\cos(\\\\theta)$. If unsure, output plain text instead of broken LaTeX!
@@ -101,7 +102,6 @@ SOURCE:
 
         prompt = _build_prompt(md_content)
 
-
         logging.info("Extracting knowledge bricks...")
         if not self._check_ollama():
             logging.error(
@@ -109,12 +109,15 @@ SOURCE:
             )
             return ""
 
+        # Determine GPU setting based on content size and configuration
+        num_gpu = -1 if self.use_gpu else 0  # -1 uses all GPUs, 0 uses CPU only
+        
         response = self._run_with_timeout(
             ollama.generate,
             model=self.model,
             prompt=prompt,
             keep_alive=0,
-            options={"num_ctx": 4096, "num_gpu": 0},
+            options={"num_ctx": 8192, "num_gpu": num_gpu},  # Larger context, GPU enabled
             timeout=self.timeout,
         )
 
@@ -134,7 +137,7 @@ SOURCE:
         # Primary attempt
         knowledge_bricks = _extract_from_response(response)
 
-        # Fallback: chunk-based extraction + merge
+        # Fallback: chunk-based extraction + merge ONLY if primary fails
         if not knowledge_bricks:
             logging.warning("Primary knowledge extraction failed/empty. Falling back to chunk-based extraction.")
             chunks = _chunk_text(md_content, chunk_size=3000, overlap=300)
@@ -148,8 +151,8 @@ SOURCE:
                     model=self.model,
                     prompt=ch_prompt,
                     keep_alive=0,
-                    options={"num_ctx": 2048, "num_gpu": 0},
-                    timeout=min(self.timeout, 240),
+                    options={"num_ctx": 4096, "num_gpu": num_gpu},
+                    timeout=min(self.timeout, 600),
                 )
                 kb = _extract_from_response(ch_resp)
                 if kb:
@@ -177,8 +180,8 @@ PARTIALS:
                 model=self.model,
                 prompt=merge_prompt,
                 keep_alive=0,
-                options={"num_ctx": 2048, "num_gpu": 0},
-                timeout=min(self.timeout, 240),
+                options={"num_ctx": 4096, "num_gpu": num_gpu},
+                timeout=min(self.timeout, 300),
             )
 
             knowledge_bricks = _extract_from_response(merge_resp)
@@ -187,4 +190,3 @@ PARTIALS:
         OUTPUT_DIR.mkdir(exist_ok=True)
         (OUTPUT_DIR / "knowledge_bricks.md").write_text(knowledge_bricks or "", encoding="utf-8")
         return knowledge_bricks or ""
-
