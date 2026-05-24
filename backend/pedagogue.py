@@ -16,9 +16,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 class PedagogueAgent:
 
-    def __init__(self, model: str = "llama3.2:3b", timeout: int = 180):
+    def __init__(self, model: str = "llama3.2:3b", timeout: int = 600, use_gpu: bool = True):
         self.model = model
         self.timeout = timeout
+        self.use_gpu = use_gpu
         self._log_gpu_status()
 
     def _log_gpu_status(self):
@@ -39,7 +40,7 @@ class PedagogueAgent:
         except Exception as e:
             logging.warning(f"Could not check Ollama GPU status: {e}")
 
-    def _run_with_timeout(self, fn, *args, timeout: int = 180, **kwargs):
+    def _run_with_timeout(self, fn, *args, timeout: int = 600, **kwargs):
         """Thread-based timeout wrapper."""
         import concurrent.futures
 
@@ -301,7 +302,7 @@ Rules:
 - "difficulty": string (e.g., "easy", "medium", "hard").
 - "topic": string, general topic.
 - Return ONLY valid JSON array that can be parsed by JSON.parse(). NO extra text, NO markdown code blocks.
-- LATEX SAFETY RULES: Use ONLY valid KaTeX commands. NEVER invent, truncate, or hallucinate LaTeX commands (e.g., NO \\ullet, \\ext, \\heta). ONLY use standard operators like \\cdot, \\sin, \\cos, \\theta, \\frac, ^{{}}, _{{}}. 
+- LATEX SAFETY RULES: Use ONLY valid KaTeX commands. NEVER invent, truncate, or hallucinate LaTeX commands (e.g., NO \\ullet, \\ext, \\heta). ONLY use standard operators like \\cdot, \\sin, \\cos, \\theta, \\frac, etc.
 - All mathematical expressions MUST use KaTeX-compatible LaTeX, wrap inline math with $...$, and be on a SINGLE LINE.
 - Double escape backslashes in LaTeX: e.g. $\\\\cos(\\\\theta)$. If unsure, output plain text instead of broken LaTeX!
 - Text inside LaTeX (like \\\\text{...}) MUST contain proper spaces. Do NOT merge words together.
@@ -319,12 +320,15 @@ KNOWLEDGE:
             )
             return []
 
+        # Determine GPU setting
+        num_gpu = -1 if self.use_gpu else 0
+        
         response = self._run_with_timeout(
             ollama.generate,
             model=self.model,
             prompt=prompt,
             keep_alive=0,
-            options={"temperature": 0.1, "num_ctx": 2048, "num_gpu": 0},
+            options={"temperature": 0.1, "num_ctx": 4096, "num_gpu": num_gpu},  # GPU enabled
             timeout=self.timeout,
         )
 
@@ -361,8 +365,8 @@ KNOWLEDGE:
                 model=self.model,
                 prompt=repair_prompt,
                 keep_alive=0,
-                options={"temperature": 0.1, "num_ctx": 2048, "num_gpu": 0},
-                timeout=min(60, self.timeout),
+                options={"temperature": 0.1, "num_ctx": 4096, "num_gpu": num_gpu},
+                timeout=min(300, self.timeout),
             )
 
             if repair_resp is not None:
@@ -381,4 +385,3 @@ KNOWLEDGE:
             self.save_as_markdown(quiz_data, output_path)
 
         return quiz_data
-
