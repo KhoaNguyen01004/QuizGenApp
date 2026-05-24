@@ -18,9 +18,10 @@ class AdversaryAgent:
     If an answer seems unsupported, flags it and may attempt a correction.
     """
 
-    def __init__(self, model: str = "llama3.2:3b", timeout: int = 180):
+    def __init__(self, model: str = "llama3.2:3b", timeout: int = 600, use_gpu: bool = True):
         self.model = model
         self.timeout = timeout
+        self.use_gpu = use_gpu
         self._log_gpu_status()
 
     def _log_gpu_status(self):
@@ -40,7 +41,7 @@ class AdversaryAgent:
         except Exception as e:
             logging.warning(f"Could not check Ollama GPU status: {e}")
 
-    def _run_with_timeout(self, fn, *args, timeout: int = 180, **kwargs):
+    def _run_with_timeout(self, fn, *args, timeout: int = 600, **kwargs):
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(fn, *args, **kwargs)
             try:
@@ -167,6 +168,8 @@ class AdversaryAgent:
 
         # Second: model pass only for uncertain items
         if any_uncertain and self._check_ollama():
+            num_gpu = -1 if self.use_gpu else 0
+            
             for i, q in enumerate(validated):
                 if not q.get("adversary_flag", False):
                     continue
@@ -182,7 +185,7 @@ IMPORTANT LATEX AND FORMAT RULES:
 - Use the Knowledge Bricks as ground truth.
 - If none of the options are supported, set flagged=true and best_answer to the closest supported option (or keep original if equally unsupported).
 - Return ONLY valid JSON that can be parsed by JSON.parse() (NO markdown code blocks, NO extra text).
-- LATEX SAFETY RULES: Use ONLY valid KaTeX commands. NEVER invent, truncate, or hallucinate LaTeX commands (e.g., NO \\ullet, \\ext, \\heta). ONLY use standard operators like \\cdot, \\sin, \\cos, \\theta, \\frac, ^{{}}, _{{}}. 
+- LATEX SAFETY RULES: Use ONLY valid KaTeX commands. NEVER invent, truncate, or hallucinate LaTeX commands (e.g., NO \\ullet, \\ext, \\heta). ONLY use standard operators like \\cdot, \\sin, \\cos, \\theta, \\frac, etc.
 - All mathematical expressions MUST use KaTeX-compatible LaTeX, wrap inline math with $...$, and be on a SINGLE LINE.
 - DO NOT break down equations into multiple lines (NO OCR-style formatting).
 - Notes text must be clean, markdown-safe, without random line breaks or decorative emojis.
@@ -209,7 +212,7 @@ Current answer: {self._extract_letter_answer(str(q.get('answer', '')))}
                     ollama.generate,
                     model=self.model,
                     prompt=prompt,
-                    options={"num_ctx": 4096},
+                    options={"num_ctx": 4096, "num_gpu": num_gpu},
                     format="json",
                     timeout=self.timeout,
                 )
@@ -284,4 +287,3 @@ Current answer: {self._extract_letter_answer(str(q.get('answer', '')))}
             Path(output_path).write_text(json.dumps(validated, ensure_ascii=False, indent=2), encoding="utf-8")
 
         return validated
-
