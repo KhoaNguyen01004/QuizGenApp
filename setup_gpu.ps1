@@ -1,25 +1,57 @@
-# GPU Setup Script for QuizGenApp
-# Run this in your virtual environment to enable GPU acceleration
+Write-Host ""
+Write-Host "========================================"
+Write-Host " QuizGenApp Automatic Setup"
+Write-Host "========================================"
+Write-Host ""
 
-echo "Setting up GPU support for QuizGenApp..."
+# Create venv if missing
 
-# 1. Install PyTorch with CUDA support (compatible with marker-pdf >=2.7.0)
-echo "Installing PyTorch with CUDA 12.1 support (compatible version)..."
-pip uninstall torch torchvision torchaudio -y
+if (!(Test-Path "venv")) {
+Write-Host "[1/7] Creating virtual environment..."
+python -m venv venv
+}
 
-# Install torch 2.5.1+cu121 (compatible with marker-pdf despite version requirement)
-pip install torch==2.5.1+cu121 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+Write-Host "[2/7] Activating virtual environment..."
+& .\venv\Scripts\Activate.ps1
 
-# 2. Verify PyTorch CUDA
-echo "Verifying PyTorch CUDA installation..."
-python -c "import torch; print('PyTorch CUDA available:', torch.cuda.is_available()); print('CUDA version:', torch.version.cuda if torch.cuda.is_available() else 'N/A')"
-echo "Note: Dependency conflicts with marker-pdf are safe to ignore - the library works correctly."
+Write-Host "[3/7] Upgrading pip..."
+python -m pip install --upgrade pip
 
-# 3. Ollama GPU setup (external)
-echo "For Ollama GPU support:"
-echo "1. Download and install Ollama from https://ollama.com/download"
-echo "2. Ensure you have NVIDIA drivers with CUDA support"
-echo "3. Ollama will automatically use GPU if available"
-echo "4. Pull models: ollama pull qwen3:1.7b && ollama pull phi4-mini:latest"
+Write-Host "[4/7] Installing PyTorch (CPU build)..."
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
 
-echo "GPU setup complete. Restart your terminal and run: python main.py"
+Write-Host "[5/7] Installing project requirements..."
+pip install --no-cache-dir -r requirements.txt
+
+Write-Host "[6/7] Checking Ollama..."
+
+$ollamaExists = Get-Command ollama -ErrorAction SilentlyContinue
+
+if (-not $ollamaExists) {
+Write-Host ""
+Write-Host "ERROR: Ollama is not installed."
+Write-Host "Install Ollama first:"
+Write-Host "https://ollama.com/download"
+exit
+}
+
+Write-Host "[7/7] Checking required model..."
+
+$models = ollama list
+
+if ($models -notmatch "qwen3:1.7b") {
+Write-Host "Downloading qwen3:1.7b..."
+ollama pull qwen3:1.7b
+}
+
+Write-Host ""
+Write-Host "========================================"
+Write-Host " Setup Complete"
+Write-Host "========================================"
+Write-Host ""
+
+Write-Host "Run project with:"
+Write-Host ""
+Write-Host "python main.py --mode fast --num 5"
+Write-Host ""
+pause
