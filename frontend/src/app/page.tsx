@@ -51,7 +51,7 @@ export default function Home() {
   const fetchResult = async (jobId: string) => {
     try {
       const result = await api.getResult(jobId);
-      store.setResult(result.markdown, result.quiz);
+      store.setResult(result.markdown, result.quiz, result.metrics);
       toast.success("Quiz generated successfully!");
     } catch (error) {
       console.error(error);

@@ -1,5 +1,5 @@
 import axios from 'axios';
-import { GenerateResponse, StatusResponse, ResultResponse, QuizMode } from '../types';
+import { GenerateResponse, HistoryDetail, HistoryEntry, QuizMode, ResultResponse, StatusResponse } from '../types';
 
 const API_URL = 'http://localhost:8000';
 
@@ -27,5 +27,19 @@ export const api = {
   async getResult(jobId: string): Promise<ResultResponse> {
     const response = await axios.get<ResultResponse>(`${API_URL}/result/${jobId}`);
     return response.data;
-  }
+  },
+
+  async getHistory(): Promise<HistoryEntry[]> {
+    const response = await axios.get<HistoryEntry[]>(`${API_URL}/history`);
+    return response.data;
+  },
+
+  async getHistoryEntry(jobId: string): Promise<HistoryDetail> {
+    const response = await axios.get<HistoryDetail>(`${API_URL}/history/${jobId}`);
+    return response.data;
+  },
+
+  async deleteHistoryEntry(jobId: string): Promise<void> {
+    await axios.delete(`${API_URL}/history/${jobId}`);
+  },
 };

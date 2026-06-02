@@ -1,15 +1,20 @@
 """QuizGenApp — FastAPI backend.
 
 Exposes:
-  POST /generate   — Upload PDF, start background job
-  GET  /status/{job_id}  — Poll job progress
-  GET  /result/{job_id}  — Retrieve final quiz
+  POST /generate              — Upload PDF, start background job
+  GET  /status/{job_id}       — Poll job progress
+  GET  /result/{job_id}       — Retrieve final quiz
+  GET  /history               — List all completed quiz history entries
+  GET  /history/{job_id}      — Retrieve a single history entry (full payload)
+  DELETE /history/{job_id}    — Delete a history entry
 """
 
+import json
 import logging
 import re
 import uuid
 from configparser import ConfigParser
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
@@ -30,6 +35,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 # In-memory job store
 jobs: Dict[str, Dict[str, Any]] = {}
+
+# Persistent history directory
+HISTORY_DIR = Path("history")
+HISTORY_DIR.mkdir(exist_ok=True)
 
 app = FastAPI(title="QuizGenApp API", version="2.0.0")
 
@@ -261,6 +270,22 @@ async def _process_quiz(job_id: str, file_path: str, mode: str, num_questions: i
             "estimated_tokens_total": metrics.metrics.estimated_tokens_total,
         }
 
+        # ── Persist history entry ─────────────────────────────────────────────
+        history_entry = {
+            "job_id": job_id,
+            "pdf_filename": jobs[job_id].get("pdf_filename", "unknown.pdf"),
+            "created_at": jobs[job_id].get("created_at", datetime.now(timezone.utc).isoformat()),
+            "mode": jobs[job_id].get("mode", mode),
+            "num_questions_requested": jobs[job_id].get("num_questions_requested", num_questions),
+            "num_questions": len(final_quiz),
+            "quiz": final_quiz,
+            "markdown": jobs[job_id]["result_markdown"],
+            "metrics": jobs[job_id].get("metrics"),
+        }
+        history_path = HISTORY_DIR / f"{job_id}.json"
+        with open(history_path, "w", encoding="utf-8") as hf:
+            json.dump(history_entry, hf, ensure_ascii=False, indent=2)
+
         set_stage("Complete", 100)
         log(f"Generation complete. {len(final_quiz)} questions produced.")
 
@@ -293,6 +318,11 @@ async def generate_quiz(
         "result_markdown": None,
         "quiz": None,
         "metrics": None,
+        # persisted to history on completion
+        "pdf_filename": pdf.filename,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "mode": mode,
+        "num_questions_requested": num_questions,
     }
 
     background_tasks.add_task(_process_quiz, job_id, str(file_path), mode, num_questions)
@@ -324,6 +354,55 @@ async def get_result(job_id: str):
         "quiz": jobs[job_id].get("quiz", []),
         "metrics": jobs[job_id].get("metrics"),
     }
+
+
+@app.get("/history")
+async def list_history():
+    """Return metadata for all completed history entries, newest first."""
+    entries = []
+    for path in HISTORY_DIR.glob("*.json"):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # Return summary only — no quiz array or full markdown in the list
+            entries.append({
+                "job_id": data.get("job_id"),
+                "pdf_filename": data.get("pdf_filename", "unknown.pdf"),
+                "created_at": data.get("created_at"),
+                "mode": data.get("mode"),
+                "num_questions_requested": data.get("num_questions_requested"),
+                "num_questions": data.get("num_questions", 0),
+                "metrics": data.get("metrics"),
+            })
+        except Exception:
+            # Skip corrupted or incomplete files silently
+            continue
+
+    entries.sort(key=lambda e: e.get("created_at") or "", reverse=True)
+    return entries
+
+
+@app.get("/history/{job_id}")
+async def get_history_entry(job_id: str):
+    """Return full history entry (quiz + markdown + metadata) for a single job."""
+    path = HISTORY_DIR / f"{job_id}.json"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="History entry not found")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read history entry: {exc}") from exc
+
+
+@app.delete("/history/{job_id}")
+async def delete_history_entry(job_id: str):
+    """Delete a history entry by job_id."""
+    path = HISTORY_DIR / f"{job_id}.json"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="History entry not found")
+    path.unlink()
+    return {"deleted": True, "job_id": job_id}
 
 
 if __name__ == "__main__":
