@@ -1,11 +1,11 @@
 import { create } from 'zustand';
-import { JobState, QuizQuestion } from '../types';
+import { JobState, PipelineMetricsSummary, QuizQuestion } from '../types';
 
 interface StoreState extends JobState {
   setJobId: (id: string) => void;
   setIsProcessing: (isProcessing: boolean) => void;
   updateStatus: (stage: string, progress: number, logs: string[]) => void;
-  setResult: (markdown: string, quiz?: QuizQuestion[]) => void;
+  setResult: (markdown: string, quiz?: QuizQuestion[], metrics?: PipelineMetricsSummary) => void;
   setError: (error: string) => void;
   reset: () => void;
 }
@@ -30,7 +30,7 @@ export const useStore = create<StoreState>((set) => ({
   
   updateStatus: (stage, progress, logs) => set({ stage, progress, logs }),
   
-  setResult: (markdown, quiz) => set({ markdown, quiz, isProcessing: false, progress: 100 }),
+  setResult: (markdown, quiz, metrics) => set({ markdown, quiz, metrics, isProcessing: false, progress: 100 }),
   
   setError: (error) => set({ error, isProcessing: false }),
   

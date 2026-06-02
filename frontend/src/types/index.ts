@@ -37,6 +37,25 @@ export interface QuizQuestion {
 
 export type QuizMode = "accuracy" | "fast";
 
+// ── History ────────────────────────────────────────────────────────────────
+
+/** Metadata-only entry returned by GET /history (no quiz array or markdown). */
+export interface HistoryEntry {
+  job_id: string;
+  pdf_filename: string;
+  created_at: string; // ISO-8601 UTC
+  mode: QuizMode;
+  num_questions_requested: number;
+  num_questions: number;
+  metrics?: PipelineMetricsSummary | null;
+}
+
+/** Full entry returned by GET /history/{job_id} — includes quiz and markdown. */
+export interface HistoryDetail extends HistoryEntry {
+  quiz: QuizQuestion[];
+  markdown: string;
+}
+
 export interface JobState {
   jobId: string | null;
   stage: string;
