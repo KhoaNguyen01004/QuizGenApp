@@ -13,13 +13,15 @@ import json
 import logging
 import re
 import uuid
-from configparser import ConfigParser
+import asyncio
+import json
+import time
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Dict
-
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, UploadFile, Form, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from typing import Dict, Any, List, Optional
+from pathlib import Path
+import logging
 
 from backend.adversary import AdversaryAgent
 from backend.curator import CuratorAgent
@@ -36,11 +38,41 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 # In-memory job store
 jobs: Dict[str, Dict[str, Any]] = {}
 
-# Persistent history directory
 HISTORY_DIR = Path("history")
 HISTORY_DIR.mkdir(exist_ok=True)
 
-app = FastAPI(title="QuizGenApp API", version="2.0.0")
+
+def _save_history(job_id: str, data: Dict[str, Any]) -> None:
+    path = HISTORY_DIR / f"{job_id}.json"
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _load_history(job_id: str) -> Optional[Dict[str, Any]]:
+    path = HISTORY_DIR / f"{job_id}.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _list_history() -> List[Dict[str, Any]]:
+    entries = []
+    for p in sorted(HISTORY_DIR.glob("*.json"), key=lambda f: f.stat().st_mtime, reverse=True):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            # Return lightweight metadata only (no quiz array, no markdown)
+            entry = {k: data[k] for k in (
+                "job_id", "pdf_filename", "created_at", "mode",
+                "num_questions_requested", "num_questions", "metrics"
+            ) if k in data}
+            entries.append(entry)
+        except Exception:
+            continue
+    return entries
+
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
@@ -58,9 +90,10 @@ def _load_config() -> ConfigParser:
 
 
 async def _process_quiz(job_id: str, file_path: str, mode: str, num_questions: int):
-    """Background task: run the full quiz generation pipeline."""
+    base_path = Path(".")
+    start_time = time.monotonic()
 
-    def log(msg: str, level: str = "info"):
+    def log(msg, level="info"):
         if level == "info":
             logging.info(msg)
         elif level == "error":
@@ -69,46 +102,13 @@ async def _process_quiz(job_id: str, file_path: str, mode: str, num_questions: i
             logging.warning(msg)
         jobs[job_id]["logs"].append(f"[{level.upper()}] {msg}")
 
-    def set_stage(stage: str, progress: int):
-        jobs[job_id]["stage"] = stage
-        jobs[job_id]["progress"] = progress
-        log(stage)
-
     try:
-        cfg = _load_config()
-        models_cfg = cfg["models"] if cfg.has_section("models") else {}
-        rag_cfg = cfg["rag"] if cfg.has_section("rag") else {}
-        adversary_cfg = cfg["adversary"] if cfg.has_section("adversary") else {}
-        extraction_cfg = cfg["extraction"] if cfg.has_section("extraction") else {}
-        logging_cfg = cfg["logging"] if cfg.has_section("logging") else {}
+        jobs[job_id]["stage"] = "Extracting PDF"
+        jobs[job_id]["progress"] = 10
+        log(f"Processing started for job {job_id} in mode {mode}.")
 
-        model_name = models_cfg.get("model", "qwen3:4b")
-        top_k = int(rag_cfg.get("top_k", "8"))
-        chunk_size = int(rag_cfg.get("chunk_size", "512"))
-        chunk_overlap = int(rag_cfg.get("chunk_overlap", "64"))
-        candidate_multiplier = float(rag_cfg.get("candidate_multiplier", "2.0"))
-        acceptance_threshold = int(adversary_cfg.get("acceptance_threshold", "60"))
-        embedding_model = rag_cfg.get("embedding_model", "all-MiniLM-L6-v2")
+        extractor = PDFExtractor()
 
-        # H-4: read extraction config
-        use_gpu = extraction_cfg.get("use_gpu", "true").strip().lower() == "true"
-        batch_multiplier = int(extraction_cfg.get("batch_multiplier", "2"))
-
-        # H-5: apply log level from config to root logger
-        log_level_str = logging_cfg.get("level", "INFO").strip().upper()
-        log_level = getattr(logging, log_level_str, logging.INFO)
-        logging.getLogger().setLevel(log_level)
-
-        metrics = MetricsCollector()
-        metrics.metrics.model_used = model_name
-        metrics.metrics.num_questions_requested = num_questions
-
-        # ── Phase 1: Extraction ───────────────────────────────────────────────
-        set_stage("Extracting PDF", 5)
-        metrics.start_timer("extraction")
-
-        # H-4: pass use_gpu and batch_multiplier from config
-        extractor = PDFExtractor(use_gpu=use_gpu, batch_multiplier=batch_multiplier)
         if mode == "fast":
             md_content = extractor.fast_extract(file_path) or ""
             if not md_content:
@@ -116,178 +116,131 @@ async def _process_quiz(job_id: str, file_path: str, mode: str, num_questions: i
         else:
             md_content = extractor.fast_extract(file_path) or ""
             need_precision = True
-            if md_content and len(md_content) >= 3000:
-                if not re.search(r"\\[a-zA-Z]|\$|\\\(|\\\)", md_content):
-                    need_precision = False
+            if md_content:
+                if len(md_content) >= 3000:
+                    import re
+                    if not re.search(r"\\\[a-zA-Z]|\$|\\\(|\\\)", md_content):
+                        need_precision = False
+
             if need_precision:
                 log("Running precision extraction for accuracy.")
                 md_content = extractor.precision_extract(file_path)
                 if not md_content:
                     raise Exception("Precision extraction failed.")
 
-        metrics.stop_timer("extraction")
-        log(f"Extracted {len(md_content):,} characters.")
+        jobs[job_id]["stage"] = "Curating Knowledge"
+        jobs[job_id]["progress"] = 30
+        log(f"Extracted {len(md_content)} chars of MD.")
 
-        # Task 8: record OCR sub-timings
-        metrics.set_ocr_times(
-            native_time=extractor.native_time,
-            ocr_time=extractor.ocr_time,
-            ocr_skipped=(extractor.ocr_time == 0.0),
-        )
-
-        # ── Phase 2: RAG Indexing ─────────────────────────────────────────────
-        set_stage("Building RAG Index", 15)
-        metrics.start_timer("rag_index")
-
-        chunks = chunk_document(md_content, chunk_size=chunk_size, overlap=chunk_overlap)
-        log(f"Document chunked into {len(chunks)} segments.")
-
-        # H-2: pass metrics so RAGIndexer records retrieval latency
-        rag_indexer = RAGIndexer(model_name=embedding_model, metrics=metrics)
-        rag_indexer.build_index(chunks)
-
-        metrics.stop_timer("rag_index")
-
-        # ── Shared LLM ────────────────────────────────────────────────────────
-        llm = LLMProvider(model=model_name, timeout=600)
-
-        # ── Phase 3: Curator ──────────────────────────────────────────────────
-        set_stage("Curating Knowledge", 25)
-        curator = CuratorAgent(llm=llm, metrics=metrics)
-        knowledge_bricks = curator.extract_knowledge(
-            md_content=md_content,
-            rag_indexer=rag_indexer,
-            top_k=top_k,
-        )
+        curator_agent = curator.CuratorAgent()
+        knowledge_bricks = curator_agent.extract_knowledge(md_content)
         if not knowledge_bricks:
             raise Exception("Knowledge extraction failed.")
 
-        # ── Phase 4: Pedagogue ────────────────────────────────────────────────
-        set_stage("Generating Candidate Questions", 40)
-        pedagogue = PedagogueAgent(llm=llm, metrics=metrics)
-        candidates = pedagogue.generate_quiz(
+        jobs[job_id]["stage"] = "Generating Questions"
+        jobs[job_id]["progress"] = 50
+
+        cfg = ConfigParser()
+        cfg.read(str(base_path / "config.ini"), encoding="utf-8")
+        models = cfg["models"] if cfg.has_section("models") else {}
+
+        pedagogue_model = models.get("pedagogue_model", "llama3.2:3b")
+        adversary_model = models.get("adversary_model", "llama3.2:3b")
+        explainer_model = models.get("explainer_model", "llama3.2:3b")
+
+        teacher = pedagogue.PedagogueAgent(model=pedagogue_model, timeout=600)
+
+        await asyncio.sleep(5)
+
+        quiz_data = teacher.generate_quiz(
             knowledge_bricks=knowledge_bricks,
             output_path=None,
-            num_questions=num_questions,
-            rag_indexer=rag_indexer,
-            candidate_multiplier=candidate_multiplier,
+            num_questions=num_questions
         )
-        if not candidates:
-            raise Exception("Failed to generate candidate questions.")
 
-        log(f"Generated {len(candidates)} candidate questions.")
+        if not quiz_data:
+            raise Exception("Failed to generate quiz data.")
 
-        # ── Phase 5: Adversary ────────────────────────────────────────────────
-        set_stage("Validating Questions", 60)
-        adversary = AdversaryAgent(
-            llm=llm,
-            acceptance_threshold=acceptance_threshold,
-            metrics=metrics,
-        )
-        validated = adversary.validate_quiz(
+        candidates_generated = len(quiz_data)
+
+        jobs[job_id]["stage"] = "Validating Questions"
+        jobs[job_id]["progress"] = 70
+        log(f"Generated {candidates_generated} questions. Validating...")
+
+        adversary = AdversaryAgent(model=adversary_model, timeout=600)
+        validated_quiz = adversary.validate_quiz(
             knowledge_bricks=knowledge_bricks,
-            quiz_data=candidates,
-            output_path=None,
-            num_questions=num_questions,
-            rag_indexer=rag_indexer,
-        )
-        if not validated:
-            raise Exception("Adversary validation returned empty quiz.")
-
-        accepted = sum(1 for q in validated if not q.get("adversary_flag", False))
-        log(f"Adversary: {accepted}/{len(validated)} questions accepted.")
-
-        # ── Phase 5.5: Answer Consistency Validation ──────────────────────────
-        set_stage("Checking Answer Consistency", 65)
-
-        # C-2: build source_chunks mapping from each question's source_chunk_id
-        source_chunks_for_validation = {}
-        for q in validated:
-            chunk_id = q.get("source_chunk_id")
-            if chunk_id is not None and chunk_id >= 0 and chunk_id < len(rag_indexer.chunks):
-                source_chunks_for_validation[q.get("id", 0)] = rag_indexer.chunks[chunk_id]
-
-        consistency_validator = AnswerConsistencyValidator(strict=True)
-        passed_consistency, rejected_consistency = consistency_validator.validate_batch(
-            validated,
-            source_chunks=source_chunks_for_validation if source_chunks_for_validation else None,
+            quiz_data=quiz_data,
+            output_path=None
         )
 
-        metrics.metrics.answer_consistency_failures = consistency_validator.get_failure_report().get(
-            "answer_not_in_options", 0
-        )
-        metrics.metrics.explanation_consistency_failures = consistency_validator.get_failure_report().get(
-            "explanation_mismatch", 0
-        )
-        metrics.metrics.unsupported_questions = (
-            consistency_validator.get_failure_report().get("source_mismatch", 0)
-            + consistency_validator.get_failure_report().get("unsupported_claim", 0)
-        )
-        metrics.metrics.ambiguity_failures = consistency_validator.get_failure_report().get("ambiguous_answer", 0)
-        metrics.metrics.questions_with_issues = len(rejected_consistency)
+        if not validated_quiz:
+            raise Exception("Adversary validation returned an empty quiz.")
 
-        log(
-            f"Consistency check: {len(passed_consistency)} passed, {len(rejected_consistency)} rejected."
+        # Compute adversary metrics from flagging data
+        flagged_count = sum(1 for q in validated_quiz if q.get("adversary_flag", False))
+        not_flagged_count = len(validated_quiz) - flagged_count
+        avg_adversary_score = not_flagged_count / len(validated_quiz) if validated_quiz else 1.0
+
+        jobs[job_id]["stage"] = "Creating Explanations"
+        jobs[job_id]["progress"] = 85
+        log("Validation complete. Generating explanations...")
+
+        explainer = ExplainerAgent(model=explainer_model, timeout=600)
+        final_quiz = explainer.generate_explanations(
+            knowledge_bricks=knowledge_bricks,
+            quiz_data=validated_quiz,
+            output_path=None
         )
-        validated = passed_consistency
 
-        # ── Phase 6: Explainer ────────────────────────────────────────────────
-        if mode == "fast":
-            log("Fast mode: skipping Explainer (saves 10-15s).")
-            final_quiz = validated
-        else:
-            set_stage("Generating Explanations", 80)
-            explainer = ExplainerAgent(llm=llm, metrics=metrics)
-            final_quiz = explainer.generate_explanations(
-                knowledge_bricks=knowledge_bricks,
-                quiz_data=validated,
-                output_path=None,
-                rag_indexer=rag_indexer,
-            )
-            if not final_quiz:
-                raise Exception("Explainer returned empty quiz.")
+        if not final_quiz:
+            raise Exception("Explainer generation returned an empty quiz.")
 
-        # ── Save outputs ──────────────────────────────────────────────────────
-        set_stage("Saving Results", 95)
-        OUTPUT_DIR = Path("outputs")
+        jobs[job_id]["stage"] = "Complete"
+        jobs[job_id]["progress"] = 100
+
+        OUTPUT_DIR = base_path / "outputs"
         OUTPUT_DIR.mkdir(exist_ok=True)
-        final_md_path = OUTPUT_DIR / "Generated_Quiz.md"
-        pedagogue.save_as_markdown(final_quiz, str(final_md_path))
+        final_md_path = OUTPUT_DIR / "Generate_Quiz.md"
+        teacher.save_as_markdown(final_quiz, str(final_md_path))
 
         with open(final_md_path, "r", encoding="utf-8") as f:
             jobs[job_id]["result_markdown"] = f.read()
 
+
         jobs[job_id]["quiz"] = final_quiz
 
-        metrics.save(str(OUTPUT_DIR))
-        jobs[job_id]["metrics"] = {
-            "total_time": metrics.metrics.total_time,
-            "candidates_generated": metrics.metrics.candidates_generated,
-            "questions_accepted": metrics.metrics.questions_accepted,
-            "questions_rejected": metrics.metrics.questions_rejected,
-            "acceptance_rate": metrics.metrics.acceptance_rate,
-            "average_adversary_score": metrics.metrics.average_adversary_score,
-            "estimated_tokens_total": metrics.metrics.estimated_tokens_total,
-        }
+        total_time = time.monotonic() - start_time
+        questions_accepted = len(final_quiz)
+        questions_rejected = max(0, candidates_generated - questions_accepted)
+        acceptance_rate = questions_accepted / candidates_generated if candidates_generated > 0 else 1.0
+        estimated_tokens = int((len(md_content) + len(knowledge_bricks)) / 4 * 1.5)
 
-        # ── Persist history entry ─────────────────────────────────────────────
-        history_entry = {
+        metrics = {
+            "total_time": round(total_time, 1),
+            "candidates_generated": candidates_generated,
+            "questions_accepted": questions_accepted,
+            "questions_rejected": questions_rejected,
+            "acceptance_rate": round(acceptance_rate, 4),
+            "average_adversary_score": round(avg_adversary_score * 10, 1),
+            "estimated_tokens_total": estimated_tokens,
+        }
+        jobs[job_id]["metrics"] = metrics
+
+        # Persist to history directory
+        _save_history(job_id, {
             "job_id": job_id,
             "pdf_filename": jobs[job_id].get("pdf_filename", "unknown.pdf"),
             "created_at": jobs[job_id].get("created_at", datetime.now(timezone.utc).isoformat()),
-            "mode": jobs[job_id].get("mode", mode),
-            "num_questions_requested": jobs[job_id].get("num_questions_requested", num_questions),
-            "num_questions": len(final_quiz),
+            "mode": mode,
+            "num_questions_requested": num_questions,
+            "num_questions": questions_accepted,
+            "metrics": metrics,
             "quiz": final_quiz,
             "markdown": jobs[job_id]["result_markdown"],
-            "metrics": jobs[job_id].get("metrics"),
-        }
-        history_path = HISTORY_DIR / f"{job_id}.json"
-        with open(history_path, "w", encoding="utf-8") as hf:
-            json.dump(history_entry, hf, ensure_ascii=False, indent=2)
+        })
 
-        set_stage("Complete", 100)
-        log(f"Generation complete. {len(final_quiz)} questions produced.")
+        log("Generation finished successfully.")
 
     except Exception as e:
         jobs[job_id]["stage"] = "Error"
@@ -304,9 +257,11 @@ async def generate_quiz(
 ):
     job_id = str(uuid.uuid4())
 
+
     upload_dir = Path("uploads")
     upload_dir.mkdir(exist_ok=True)
     file_path = upload_dir / f"{job_id}_{pdf.filename}"
+
 
     with open(file_path, "wb") as f:
         f.write(await pdf.read())
@@ -316,9 +271,6 @@ async def generate_quiz(
         "progress": 0,
         "logs": [],
         "result_markdown": None,
-        "quiz": None,
-        "metrics": None,
-        # persisted to history on completion
         "pdf_filename": pdf.filename,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "mode": mode,
@@ -346,8 +298,10 @@ async def get_result(job_id: str):
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
 
+
     if jobs[job_id]["result_markdown"] is None:
         raise HTTPException(status_code=400, detail="Result not ready yet")
+
 
     return {
         "markdown": jobs[job_id]["result_markdown"],
@@ -356,53 +310,27 @@ async def get_result(job_id: str):
     }
 
 
-@app.get("/history")
-async def list_history():
-    """Return metadata for all completed history entries, newest first."""
-    entries = []
-    for path in HISTORY_DIR.glob("*.json"):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            # Return summary only — no quiz array or full markdown in the list
-            entries.append({
-                "job_id": data.get("job_id"),
-                "pdf_filename": data.get("pdf_filename", "unknown.pdf"),
-                "created_at": data.get("created_at"),
-                "mode": data.get("mode"),
-                "num_questions_requested": data.get("num_questions_requested"),
-                "num_questions": data.get("num_questions", 0),
-                "metrics": data.get("metrics"),
-            })
-        except Exception:
-            # Skip corrupted or incomplete files silently
-            continue
+# ── History endpoints ──────────────────────────────────────────────────────
 
-    entries.sort(key=lambda e: e.get("created_at") or "", reverse=True)
-    return entries
+@app.get("/history")
+async def get_history():
+    return _list_history()
 
 
 @app.get("/history/{job_id}")
 async def get_history_entry(job_id: str):
-    """Return full history entry (quiz + markdown + metadata) for a single job."""
-    path = HISTORY_DIR / f"{job_id}.json"
-    if not path.exists():
+    data = _load_history(job_id)
+    if data is None:
         raise HTTPException(status_code=404, detail="History entry not found")
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to read history entry: {exc}") from exc
+    return data
 
 
-@app.delete("/history/{job_id}")
+@app.delete("/history/{job_id}", status_code=204)
 async def delete_history_entry(job_id: str):
-    """Delete a history entry by job_id."""
     path = HISTORY_DIR / f"{job_id}.json"
     if not path.exists():
         raise HTTPException(status_code=404, detail="History entry not found")
     path.unlink()
-    return {"deleted": True, "job_id": job_id}
 
 
 if __name__ == "__main__":
