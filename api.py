@@ -1,4 +1,17 @@
-import os
+"""QuizGenApp — FastAPI backend.
+
+Exposes:
+  POST /generate              — Upload PDF, start background job
+  GET  /status/{job_id}       — Poll job progress
+  GET  /result/{job_id}       — Retrieve final quiz
+  GET  /history               — List all completed quiz history entries
+  GET  /history/{job_id}      — Retrieve a single history entry (full payload)
+  DELETE /history/{job_id}    — Delete a history entry
+"""
+
+import json
+import logging
+import re
 import uuid
 import asyncio
 import json
@@ -10,13 +23,19 @@ from typing import Dict, Any, List, Optional
 from pathlib import Path
 import logging
 
-from backend.utils.text_extractor import PDFExtractor
-from backend import curator, pedagogue
 from backend.adversary import AdversaryAgent
+from backend.curator import CuratorAgent
 from backend.explainer import ExplainerAgent
-from configparser import ConfigParser
+from backend.llm_provider import LLMProvider
+from backend.pedagogue import PedagogueAgent
+from backend.utils.metrics import MetricsCollector
+from backend.utils.rag import RAGIndexer, chunk_document
+from backend.utils.text_extractor import PDFExtractor
+from backend.validators import AnswerConsistencyValidator
 
-# Job internal state map
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# In-memory job store
 jobs: Dict[str, Dict[str, Any]] = {}
 
 HISTORY_DIR = Path("history")
@@ -63,7 +82,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-logging.basicConfig(level=logging.INFO)
+
+def _load_config() -> ConfigParser:
+    cfg = ConfigParser()
+    cfg.read("config.ini", encoding="utf-8")
+    return cfg
+
 
 async def _process_quiz(job_id: str, file_path: str, mode: str, num_questions: int):
     base_path = Path(".")
@@ -74,6 +98,8 @@ async def _process_quiz(job_id: str, file_path: str, mode: str, num_questions: i
             logging.info(msg)
         elif level == "error":
             logging.error(msg)
+        elif level == "warning":
+            logging.warning(msg)
         jobs[job_id]["logs"].append(f"[{level.upper()}] {msg}")
 
     try:
@@ -181,6 +207,7 @@ async def _process_quiz(job_id: str, file_path: str, mode: str, num_questions: i
         with open(final_md_path, "r", encoding="utf-8") as f:
             jobs[job_id]["result_markdown"] = f.read()
 
+
         jobs[job_id]["quiz"] = final_quiz
 
         total_time = time.monotonic() - start_time
@@ -226,13 +253,15 @@ async def generate_quiz(
     background_tasks: BackgroundTasks,
     pdf: UploadFile = File(...),
     mode: str = Form("accuracy"),
-    num_questions: int = Form(20)
+    num_questions: int = Form(20),
 ):
     job_id = str(uuid.uuid4())
+
 
     upload_dir = Path("uploads")
     upload_dir.mkdir(exist_ok=True)
     file_path = upload_dir / f"{job_id}_{pdf.filename}"
+
 
     with open(file_path, "wb") as f:
         f.write(await pdf.read())
@@ -260,16 +289,19 @@ async def get_status(job_id: str):
     return {
         "stage": jobs[job_id]["stage"],
         "progress": jobs[job_id]["progress"],
-        "logs": jobs[job_id]["logs"]
+        "logs": jobs[job_id]["logs"],
     }
+
 
 @app.get("/result/{job_id}")
 async def get_result(job_id: str):
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
 
+
     if jobs[job_id]["result_markdown"] is None:
         raise HTTPException(status_code=400, detail="Result not ready yet")
+
 
     return {
         "markdown": jobs[job_id]["result_markdown"],
@@ -303,4 +335,6 @@ async def delete_history_entry(job_id: str):
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)
+

@@ -1,287 +1,457 @@
-import concurrent.futures
+"""Adversary Agent — Enhanced for quality assurance and educational rigor.
+
+Implements Task 7/8 validation gatekeeping and strict JSON enforcement.
+
+Key reliability guarantees (per Instruction.md):
+- Strict JSON enforcement with at most one repair retry; invalid JSON => reject batch (FAILED per-question).
+- Deterministic acceptance: accept = supported_by_source AND answer_consistent AND explanation_consistent AND score >= threshold.
+- Deterministic final gatekeeper: only export questions that pass all checks.
+- No heuristic fallback paths that could leak invalid/unsupported questions.
+"""
+
 import json
 import logging
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import ollama
+from backend.llm_provider import LLMProvider
+from backend.utils.json_utils import safe_parse_json
+from backend.utils.metrics import MetricsCollector
+from backend.utils.rag import RAGIndexer
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+
+# ── Prompt templates ───────────────────────────────────────────────────────────
+
+_ADVERSARY_SYSTEM = """You are an MCQ quality auditor. Score each question 0-100 on rigorous criteria.
+
+SCORING RUBRIC:
+- Factual correctness (40%): Answer is factually correct per source. No wrong facts.
+- Source support (30%): Answer is evidenced in source. Explanation cites source.
+- Clarity (15%): Question is unambiguous. Only ONE correct answer (no ambiguity).
+- Difficulty/Quality (15%): Distractors are plausible. Question tests understanding.
+
+DETERMINISTIC SCORING RULES:
+- supported_by_source=false => score <= 20, accept=false
+- answer_consistent=false => score = 0, accept=false
+- explanation_consistent=false => score = 0, accept=false
+- Multiple valid answers (ambiguous) => score <= 20, accept=false
+- Otherwise: score based on rubric above
+
+ACCEPTANCE CRITERIA (all must be true):
+accept = supported_by_source AND answer_consistent AND explanation_consistent AND score >= 50
+
+OUTPUT: JSON array only. Schema per item:
+{
+  "id":<int>,
+  "supported_by_source":<bool>,
+  "answer_consistent":<bool>,
+  "explanation_consistent":<bool>,
+  "score":<int>,
+  "accept":<bool>,
+  "issues":["issue1","issue2"],
+  "corrected_answer":"A|B|C|D|null"
+}
+
+Return JSON array ONLY. No other text."""
+
+_ADVERSARY_USER = """VERIFICATION TASK:
+1. Check if answer is factually correct per source (supported_by_source)
+2. Verify explanation supports the marked answer (answer_consistent)
+3. Verify explanation is supported by source (explanation_consistent)
+4. Detect if multiple options could be correct (ambiguity)
+5. Score on rubric, apply deterministic rules
+
+SOURCE:
+{knowledge}
+
+QUESTIONS:
+{questions_json}
+
+Return JSON array only."""
 
 
 class AdversaryAgent:
-    """Phase 3: Validation / Fact-checking.
+    """Validates and scores candidate questions, selects top N (deterministic gatekeeping)."""
 
-    Receives quiz_data from Pedagogue + knowledge_bricks (source).
-    Validates each question's answer by checking support from knowledge_bricks.
-    If an answer seems unsupported, flags it and may attempt a correction.
-    """
+    def __init__(
+        self,
+        llm: Optional[LLMProvider] = None,
+model: str = "qwen3:4b",
+        timeout: int = 600,
+        acceptance_threshold: int = 60,
+        metrics: Optional[MetricsCollector] = None,
+    ):
+        self.llm = llm or LLMProvider(model=model, timeout=timeout)
+        self.acceptance_threshold = acceptance_threshold
+        self.metrics = metrics
 
-    def __init__(self, model: str = "llama3.2:3b", timeout: int = 180):
-        self.model = model
-        self.timeout = timeout
-        self._log_gpu_status()
+    def _format_questions_for_prompt(self, questions: List[Dict[str, Any]]) -> str:
+        compact = []
+        for q in questions:
+            options = q.get("options", [])
+            opts_labeled = {chr(65 + i): opt for i, opt in enumerate(options[:4])}
+            compact.append(
+                {
+                    "id": q.get("id", 0),
+                    "question": q.get("question", ""),
+                    "options": opts_labeled,
+                    "marked_answer": q.get("answer", "A"),
+                }
+            )
+        return json.dumps(compact, ensure_ascii=False, indent=2)
 
-    def _log_gpu_status(self):
-        try:
-            info = ollama.ps()
-            gpu_info = "GPU support unknown"
+    def _parse_scores(self, raw: str) -> List[Dict[str, Any]]:
+        parsed = safe_parse_json(raw or "")
+        if parsed is None or not isinstance(parsed, list):
+            return []
 
-            has_models = False
-            if hasattr(info, "models") and info.models:
-                has_models = True
-            elif isinstance(info, (list, dict)) and len(info) > 0:
-                has_models = True
+        results: List[Dict[str, Any]] = []
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
 
-            if has_models:
-                gpu_info = "Ollama running (GPU support depends on installation)"
-            logging.info(f"Ollama GPU status: {gpu_info}")
-        except Exception as e:
-            logging.warning(f"Could not check Ollama GPU status: {e}")
+            q_id = item.get("id", 0)
+            supported_by_source = bool(item.get("supported_by_source", False))
+            answer_consistent = bool(item.get("answer_consistent", False))
+            explanation_consistent = bool(item.get("explanation_consistent", False))
 
-    def _run_with_timeout(self, fn, *args, timeout: int = 180, **kwargs):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(fn, *args, **kwargs)
-            try:
-                return future.result(timeout=timeout)
-            except concurrent.futures.TimeoutError:
-                logging.error("Ollama request timed out after %s seconds.", timeout)
-                return None
-            except Exception as exc:
-                logging.error("Ollama request failed: %s", exc)
-                return None
+            score = item.get("score", 0)
+            if not isinstance(score, (int, float)):
+                try:
+                    score = int(score)
+                except (ValueError, TypeError):
+                    score = 0
+            score = max(0, min(100, int(score)))
 
-    def _check_ollama(self) -> bool:
-        try:
-            ollama.list()
-            return True
-        except Exception:
-            return False
+            # TASK 6 deterministic scoring rules
+            if not supported_by_source:
+                score = min(score, 20)
+            if not answer_consistent:
+                score = 0
+            if not explanation_consistent:
+                score = 0
 
-    def _normalize_space(self, s: str) -> str:
-        return re.sub(r"\s+", " ", s or "").strip()
+            accept = (
+                supported_by_source
+                and answer_consistent
+                and explanation_consistent
+                and score >= 50
+            )
 
-    def _extract_letter_answer(self, answer: str) -> str:
-        a = (answer or "").strip().upper()
-        # Expect formats like "A", "B", "C", "D"
-        m = re.match(r"^([ABCD])\b", a)
-        if m:
-            return m.group(1)
-        return a[:1] if a else ""
+            corrected = item.get("corrected_answer")
+            if corrected:
+                corrected = str(corrected).strip().upper()
+                if not re.match(r"^[ABCD]$", corrected):
+                    corrected = None
 
-    def _letter_to_option_map(self, options: Any) -> Dict[str, str]:
-        # options may be list like ["A) ...", "B) ..."] or ["A. ..."] etc
-        # We'll index by first occurrence of A/B/C/D.
-        mapping: Dict[str, str] = {"A": "", "B": "", "C": "", "D": ""}
-        if not isinstance(options, list):
-            return mapping
+            issues = item.get("issues", [])
+            if not isinstance(issues, list):
+                issues = []
 
-        for opt in options:
-            opt_str = str(opt)
-            opt_str_norm = opt_str.strip()
-            m = re.match(r"^\s*([ABCD])[\)\.]\s*(.*)$", opt_str_norm, flags=re.IGNORECASE)
-            if m:
-                letter = m.group(1).upper()
-                mapping[letter] = m.group(2).strip()
+            results.append(
+                {
+                    "id": q_id,
+                    "supported_by_source": supported_by_source,
+                    "answer_consistent": answer_consistent,
+                    "explanation_consistent": explanation_consistent,
+                    "score": score,
+                    "verdict": "accept" if accept else "reject",
+                    "accept": accept,
+                    "corrected_answer": corrected,
+                    "issues": issues,
+                    "notes": str(item.get("notes", "")),
+                }
+            )
+
+        return results
+
+    def _reject_batch_as_failed(self, batch: List[Dict[str, Any]], issues: List[str]) -> List[Dict[str, Any]]:
+        return [
+            {
+                "id": q.get("id", 0),
+                "supported_by_source": False,
+                "answer_consistent": False,
+                "explanation_consistent": False,
+                "score": 0,
+                "verdict": "reject",
+                "accept": False,
+                "corrected_answer": None,
+                "issues": issues,
+                "notes": "; ".join(issues),
+            }
+            for q in batch
+        ]
+
+    def _validate_batch(
+        self,
+        batch: List[Dict[str, Any]],
+        knowledge: str,
+        batch_idx: int,
+        rag_indexer: Optional[RAGIndexer] = None,
+    ) -> List[Dict[str, Any]]:
+        """Validate a single batch with strict JSON enforcement (Task 1/2).
+
+        If JSON parsing fails, retry once with repair prompt.
+        If still invalid, reject batch deterministically (FAILED per-question).
+        """
+        if rag_indexer is not None and getattr(rag_indexer, "chunks", None):
+            query = " ".join(q.get("question", "")[:60] for q in batch)
+            relevant_chunks = rag_indexer.retrieve(query, top_k=1)
+            context = relevant_chunks[0] if relevant_chunks else knowledge[:800]
+        else:
+            context = knowledge[:800]
+
+        prompt = _ADVERSARY_SYSTEM + "\n\n" + _ADVERSARY_USER.format(
+            knowledge=context,
+            questions_json=self._format_questions_for_prompt(batch),
+        )
+
+        if self.metrics:
+            self.metrics.add_token_usage("adversary", prompt)
+
+        t0 = time.perf_counter()
+        raw = self.llm.generate(prompt=prompt, options={"temperature": 0.1, "num_ctx": 3072})
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        if self.metrics:
+            self.metrics.record_llm_call("adversary", elapsed_ms)
+
+        OUTPUT_DIR = Path("outputs")
+        OUTPUT_DIR.mkdir(exist_ok=True)
+        if raw:
+            (OUTPUT_DIR / f"adversary_batch{batch_idx}.txt").write_text(raw, encoding="utf-8")
+
+        if not raw:
+            if self.metrics:
+                self.metrics.metrics.adversary_failures += len(batch)
+            return self._reject_batch_as_failed(batch, ["Adversary validation failed: no LLM response"])
+
+        parsed = safe_parse_json(raw)
+        if parsed is None or not isinstance(parsed, list):
+            if self.metrics:
+                self.metrics.metrics.json_parse_failures += 1
+
+            logger.warning(
+                f"Adversary: Batch {batch_idx} JSON parse failed, attempting repair (single retry)..."
+            )
+
+            repair_prompt = (
+                "Extract ONLY the JSON array of validation results from this text.\n"
+                "Each object needs: id, supported_by_source, answer_consistent, explanation_consistent, score, accept, issues.\n"
+                "Return ONLY valid JSON array. No other text.\n\n"
+                f"TEXT:\n{raw[:6000]}"
+            )
+
+            repair_raw = self.llm.generate(prompt=repair_prompt, options={"temperature": 0.1, "num_ctx": 3072})
+            if self.metrics:
+                self.metrics.metrics.repair_attempts += 1
+
+            parsed = safe_parse_json(repair_raw)
+
+        if parsed is None or not isinstance(parsed, list):
+            logger.error(
+                f"Adversary: Batch {batch_idx} JSON repair failed. Rejecting {len(batch)} questions."
+            )
+            if self.metrics:
+                self.metrics.metrics.adversary_failures += len(batch)
+            return self._reject_batch_as_failed(
+                batch,
+                ["Adversary validation failed: invalid JSON response after retry"],
+            )
+
+        # parsed is valid list => parse into structured results
+        return self._parse_scores(json.dumps(parsed, ensure_ascii=False))
+
+    def _final_validation_pass(self, questions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Task 7 final gatekeeper validation before export."""
+        passed: List[Dict[str, Any]] = []
+        rejected: List[Dict[str, Any]] = []
+
+        for q in questions:
+            failures: List[str] = []
+            q_id = q.get("id", 0)
+
+            if not q.get("source_chunk_id"):
+                failures.append("No source_chunk_id")
+            if not q.get("answer"):
+                failures.append("No answer")
+            if not q.get("explanation"):
+                failures.append("No explanation")
+            if not q.get("question"):
+                failures.append("No question")
+            if not q.get("options") or len(q.get("options", [])) < 4:
+                failures.append("Incomplete options")
+
+            # adversary flags
+            if not q.get("supported_by_source", False):
+                failures.append("Not supported by source")
+            if not q.get("answer_consistent", False):
+                failures.append("Answer not consistent")
+            if not q.get("explanation_consistent", False):
+                failures.append("Explanation not consistent")
+            if not q.get("accept", False) and q.get("adversary_flag", False):
+                failures.append("Adversary rejected")
+
+            if failures:
+                logger.warning(f"Question {q_id} failed final validation: {'; '.join(failures)}")
+                rejected.append(q)
+                if self.metrics:
+                    self.metrics.metrics.questions_with_issues += 1
             else:
-                # Try generic: if contains "A)" somewhere
-                m2 = re.search(r"\b([ABCD])[\)\.]\b\s*(.*)$", opt_str_norm, flags=re.IGNORECASE)
-                if m2:
-                    letter = m2.group(1).upper()
-                    mapping[letter] = m2.group(2).strip()
+                passed.append(q)
 
-        return mapping
-
-    def _quick_support_score(self, knowledge_bricks: str, candidate: str) -> int:
-        """Lightweight heuristic: counts overlapping normalized tokens."""
-        kb = self._normalize_space(knowledge_bricks).lower()
-        cand = self._normalize_space(candidate).lower()
-        if not cand:
-            return 0
-
-        # Remove LaTeX wrappers for heuristic tokenization
-        kb_clean = re.sub(r"\$[^\$]*\$", " ", kb)
-        cand_clean = re.sub(r"\$[^\$]*\$", " ", cand)
-
-        cand_tokens = [t for t in re.split(r"[^a-zA-Z0-9]+", cand_clean) if len(t) >= 4]
-        if not cand_tokens:
-            return 0
-
-        score = 0
-        for t in set(cand_tokens):
-            if t in kb_clean:
-                score += 1
-        return score
+        logger.info(
+            f"Adversary Final Gatekeeper: {len(passed)} passed, {len(rejected)} rejected final validation"
+        )
+        return passed
 
     def validate_quiz(
         self,
         knowledge_bricks: str,
         quiz_data: List[Dict[str, Any]],
         output_path: Optional[str] = None,
+        num_questions: Optional[int] = None,
+        rag_indexer: Optional[RAGIndexer] = None,
     ) -> List[Dict[str, Any]]:
-        """Returns validated quiz JSON array.
-
-        Adds fields per question:
-          - adversary_flag: bool
-          - validation_notes: str
-          - answer_corrected (optional): str (letter)
-        """
-
+        """Public API used by main.py/api.py."""
         if not quiz_data:
             return []
 
+        if self.metrics:
+            self.metrics.start_timer("adversary")
+
+        if not self.llm.is_available():
+            logger.error("Adversary: Ollama is not running. Cannot validate questions.")
+            if self.metrics:
+                self.metrics.stop_timer("adversary")
+            return []
+
+        # Split into batches
+        batch_size = 5
+        max_workers = 3
+        batches: List[Tuple[int, List[Dict[str, Any]]]] = []
+        for i in range(0, len(quiz_data), batch_size):
+            batches.append((i // batch_size, quiz_data[i : i + batch_size]))
+
+        # Build score map
+        score_map: Dict[int, Dict[str, Any]] = {}
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_batch = {
+                executor.submit(
+                    self._validate_batch,
+                    batch,
+                    knowledge_bricks,
+                    batch_idx,
+                    rag_indexer,
+                ): batch_idx
+                for batch_idx, batch in batches
+            }
+
+            for future in as_completed(future_to_batch):
+                batch_idx = future_to_batch[future]
+                try:
+                    scores = future.result()
+                    for s in scores:
+                        score_map[int(s["id"])] = s
+                except Exception as exc:
+                    logger.error(f"Adversary: Batch {batch_idx + 1} failed: {exc}")
+
+        # Apply scores back to questions (CRITICAL: preserve full original question objects)
+        scored_questions: List[Dict[str, Any]] = []
+        for q in quiz_data:
+            # IMPORTANT: start from the original question dict so no metadata is dropped
+            q2 = dict(q)
+            qid = int(q2.get("id", 0))
+            score_info = score_map.get(qid)
+
+            if score_info:
+                q2["adversary_score"] = score_info.get("score", 0)
+                q2["adversary_flag"] = not bool(score_info.get("accept", False))
+                q2["validation_notes"] = " | ".join(score_info.get("issues", []) or [])
+
+                q2["supported_by_source"] = score_info.get("supported_by_source", False)
+                q2["answer_consistent"] = score_info.get("answer_consistent", False)
+                q2["explanation_consistent"] = score_info.get("explanation_consistent", False)
+                q2["accept"] = score_info.get("accept", False)
+
+                corrected = score_info.get("corrected_answer")
+                if corrected and corrected != str(q2.get("answer", "")).upper():
+                    q2["answer"] = corrected
+                    q2["correct_answer"] = ord(corrected) - 65
+                    q2["answer_corrected"] = corrected
+            else:
+                q2["adversary_score"] = 0
+                q2["adversary_flag"] = True
+                q2["validation_notes"] = "No adversary validation"
+                q2["supported_by_source"] = False
+                q2["answer_consistent"] = False
+                q2["explanation_consistent"] = False
+                q2["accept"] = False
+
+            # Integrity assertions (do not crash pipeline; log only)
+            if q2.get("source_chunk_id", None) in (None, ""):
+                logger.warning(f"Adversary: Q{qid} missing source_chunk_id")
+            if "topic" not in q2:
+                logger.warning(f"Adversary: Q{qid} missing topic")
+            if q2.get("explanation", None) in (None, ""):
+                # This is allowed pre-explainer, but adversary final gatekeeper expects it
+                pass
+
+            scored_questions.append(q2)
+
+        scores_list = [q.get("adversary_score", 0) for q in scored_questions]
+        avg_score = (sum(scores_list) / len(scores_list)) if scores_list else 0.0
+        accepted = [q for q in scored_questions if not q.get("adversary_flag", True)]
+        rejected = [q for q in scored_questions if q.get("adversary_flag", False)]
+
+
+        if self.metrics:
+            self.metrics.stop_timer("adversary")
+            self.metrics.metrics.questions_validated = len(scored_questions)
+            self.metrics.metrics.questions_rejected = len(rejected)
+            self.metrics.metrics.average_adversary_score = round(avg_score, 1)
+
+        # Deterministic top-N selection: ONLY those >= acceptance_threshold.
+        sorted_q = sorted(scored_questions, key=lambda q: q.get("adversary_score", 0), reverse=True)
+        above_threshold = [q for q in sorted_q if q.get("adversary_score", 0) >= self.acceptance_threshold]
+
+        # If none meet threshold => return empty (deterministic gatekeeping)
+        if not above_threshold:
+            logger.warning(
+                f"Adversary: No questions above threshold {self.acceptance_threshold}. Returning 0 questions."
+            )
+            final_candidates: List[Dict[str, Any]] = []
+        else:
+            if num_questions is not None:
+                final_candidates = above_threshold[:num_questions]
+            else:
+                final_candidates = above_threshold
+
+        for i, q in enumerate(final_candidates):
+            q["id"] = i + 1
+
+        # Task 7 gatekeeper (field + adversary consistency)
+        final_validated = self._final_validation_pass(final_candidates)
+
+        if self.metrics:
+            self.metrics.metrics.questions_accepted = len(final_validated)
+
+        # Save artifacts
         OUTPUT_DIR = Path("outputs")
         OUTPUT_DIR.mkdir(exist_ok=True)
-
-        # First: deterministic heuristic pass
-        validated: List[Dict[str, Any]] = []
-        any_uncertain = False
-
-        for idx, q in enumerate(quiz_data):
-            if not isinstance(q, dict):
-                continue
-
-            answer_letter = self._extract_letter_answer(str(q.get("answer", "")))
-            options = q.get("options", [])
-            opt_map = self._letter_to_option_map(options)
-            candidate_text = opt_map.get(answer_letter, "")
-
-            score = self._quick_support_score(knowledge_bricks, f"{q.get('question','')} {candidate_text}")
-
-            # Threshold: if there are almost no overlaps, ask model.
-            adversary_flag = score < 2
-            if adversary_flag:
-                any_uncertain = True
-
-            notes = (
-                "Heuristic check: answer appears unsupported by knowledge bricks; flagged for review."
-                if adversary_flag
-                else "Heuristic check: answer seems supported by knowledge bricks."
-            )
-
-            q2 = dict(q)
-            q2["adversary_flag"] = adversary_flag
-            q2["validation_notes"] = notes
-            validated.append(q2)
-
-        # Second: model pass only for uncertain items
-        if any_uncertain and self._check_ollama():
-            for i, q in enumerate(validated):
-                if not q.get("adversary_flag", False):
-                    continue
-
-                prompt = f"""
-[SYSTEM: ADVERSARY VALIDATOR]
-You must fact-check the given MCQ using ONLY the provided Knowledge Bricks.
-If the current answer letter is unsupported or contradicts the Knowledge Bricks, choose the best supported option letter.
-Return ONLY valid JSON with this schema:
-{{"flagged": true/false, "best_answer": "A"/"B"/"C"/"D", "notes": "..."}}
-
-IMPORTANT LATEX AND FORMAT RULES:
-- Use the Knowledge Bricks as ground truth.
-- If none of the options are supported, set flagged=true and best_answer to the closest supported option (or keep original if equally unsupported).
-- Return ONLY valid JSON that can be parsed by JSON.parse() (NO markdown code blocks, NO extra text).
-- LATEX SAFETY RULES: Use ONLY valid KaTeX commands. NEVER invent, truncate, or hallucinate LaTeX commands (e.g., NO \\ullet, \\ext, \\heta). ONLY use standard operators like \\cdot, \\sin, \\cos, \\theta, \\frac, ^{{}}, _{{}}. 
-- All mathematical expressions MUST use KaTeX-compatible LaTeX, wrap inline math with $...$, and be on a SINGLE LINE.
-- DO NOT break down equations into multiple lines (NO OCR-style formatting).
-- Notes text must be clean, markdown-safe, without random line breaks or decorative emojis.
-
-
-Knowledge Bricks:
-{knowledge_bricks}
-
-Question:
-{q.get('question','')}
-
-Options:
-A) {self._letter_to_option_map(q.get('options', []))['A']}
-B) {self._letter_to_option_map(q.get('options', []))['B']}
-C) {self._letter_to_option_map(q.get('options', []))['C']}
-D) {self._letter_to_option_map(q.get('options', []))['D']}
-
-Current answer: {self._extract_letter_answer(str(q.get('answer', '')))}
-                """.strip()
-
-                logging.info(f"Adversary validating question {i+1}/{len(validated)}...")
-
-                resp = self._run_with_timeout(
-                    ollama.generate,
-                    model=self.model,
-                    prompt=prompt,
-                    options={"num_ctx": 4096},
-                    format="json",
-                    timeout=self.timeout,
-                )
-
-                raw = ""
-                parsed: Optional[Dict[str, Any]] = None
-                if resp is None:
-                    continue
-                if isinstance(resp, dict):
-                    raw = resp.get("response", "") or ""
-                else:
-                    raw = getattr(resp, "response", "") or ""
-
-                (OUTPUT_DIR / f"adversary_response_q{i+1}.txt").write_text(raw, encoding="utf-8")
-
-                # Extract JSON object if needed
-                raw_clean = raw.strip()
-                
-                def _sanitize_invalid_json_escapes(s: str) -> str:
-                    out: List[str] = []
-                    i = 0
-                    valid_after = {'"', '\\', '/', 'n', 'r', 'u'}
-                    n = len(s)
-                    while i < n:
-                        ch = s[i]
-                        if ch == "\\" and i + 1 < n:
-                            nxt = s[i + 1]
-                            if nxt == 'u':
-                                if i + 5 < n and all(c in '0123456789abcdefABCDEF' for c in s[i + 2 : i + 6]):
-                                    out.append('\\u' + s[i + 2 : i + 6])
-                                    i += 6
-                                    continue
-                            if nxt in valid_after:
-                                out.append('\\' + nxt)
-                                i += 2
-                                continue
-                            out.append('\\\\' + nxt)
-                            i += 2
-                            continue
-                        out.append(ch)
-                        i += 1
-                    return ''.join(out)
-
-                raw_clean = _sanitize_invalid_json_escapes(raw_clean)
-                
-                try:
-                    parsed = json.loads(raw_clean)
-                except Exception:
-                    # try to locate first { ... }
-                    m = re.search(r"\{[\s\S]*\}", raw_clean)
-                    if m:
-                        try:
-                            parsed = json.loads(m.group(0))
-                        except Exception:
-                            parsed = None
-
-                if not parsed or not isinstance(parsed, dict):
-                    continue
-
-                flagged = bool(parsed.get("flagged", True))
-                best_answer = str(parsed.get("best_answer", self._extract_letter_answer(str(q.get("answer", ""))))).strip().upper()
-                best_answer = self._extract_letter_answer(best_answer)
-                notes = str(parsed.get("notes", ""))
-
-                q["adversary_flag"] = flagged
-                q["validation_notes"] = notes
-                if best_answer and best_answer != self._extract_letter_answer(str(q.get("answer", ""))):
-                    q["answer_corrected"] = best_answer
-                    q["answer"] = best_answer
+        (OUTPUT_DIR / "adversary_scored.json").write_text(
+            json.dumps(scored_questions, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
 
         if output_path:
-            Path(output_path).write_text(json.dumps(validated, ensure_ascii=False, indent=2), encoding="utf-8")
+            Path(output_path).write_text(
+                json.dumps(final_validated, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
 
-        return validated
+        return final_validated
 

@@ -1,190 +1,267 @@
-import concurrent.futures
+"""Curator Agent — Task 4.
+
+Responsibilities:
+- Receive RAG-retrieved context chunks (NOT the full PDF).
+- Identify core concepts, definitions, formulas, exam-relevant content.
+- Output structured JSON knowledge bricks.
+- Ignore references, bibliographies, administrative content.
+
+BEFORE (old prompt):
+  Free-form Markdown bullet list extraction from full document.
+  No structure, fragile downstream parsing.
+
+AFTER (new prompt):
+  Structured JSON output with typed fields.
+  RAG-grounded: only receives relevant chunks.
+  Explicit filtering of noise content.
+"""
+
+import json
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
-import ollama
+from backend.llm_provider import LLMProvider
+from backend.utils.json_utils import safe_parse_json
+from backend.utils.metrics import MetricsCollector
+from backend.utils.rag import RAGIndexer, chunk_document
+
+logger = logging.getLogger(__name__)
 
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# ── Prompt templates ──────────────────────────────────────────────────────────
 
+_CURATOR_SYSTEM = """You are an educational content curator. Extract ONLY exam-relevant knowledge.
+
+EXTRACT: core concepts, definitions, formulas, theorems, key terms, processes, learning objectives.
+IGNORE: references, citations, author names, page numbers, administrative text, decorative content.
+
+OUTPUT: JSON array only. Schema per item:
+{"concept":"<name>","type":"definition|formula|theorem|process|principle|term","content":"<precise text>","importance":"high|medium|low","topic":"<broader topic>"}
+
+Rules: plain text; LaTeX inside $...$; double-escape backslashes (\\\\frac); no invented content; no emojis; return array only."""
+
+_CURATOR_USER = """Extract knowledge bricks from:
+
+{context}
+
+Return JSON array only."""
+
+
+_MERGE_SYSTEM = """Merge partial knowledge brick lists into one deduplicated JSON array.
+Keep the most complete version of each concept. Remove exact and near-duplicates.
+Return JSON array only."""
+
+_MERGE_USER = """Merge these lists:
+
+{partials}
+
+Return merged JSON array only."""
+
+
+# ── CuratorAgent ──────────────────────────────────────────────────────────────
 
 class CuratorAgent:
-    def __init__(self, model: str = "qwen3:1.7b", timeout: int = 180):
-        self.model = model
-        self.timeout = timeout
-        self._log_gpu_status()
+    """Extracts structured knowledge bricks from RAG-retrieved context."""
 
-    def _log_gpu_status(self):
-        """Log GPU availability for Ollama."""
-        try:
-            info = ollama.ps()
-            gpu_info = "GPU support unknown"
+    def __init__(
+        self,
+        llm: Optional[LLMProvider] = None,
+model: str = "qwen3:4b",
+        timeout: int = 600,
+        metrics: Optional[MetricsCollector] = None,
+    ):
+        self.llm = llm or LLMProvider(model=model, timeout=timeout)
+        self.metrics = metrics
 
-            has_models = False
-            if hasattr(info, "models") and info.models:
-                has_models = True
-            elif isinstance(info, (list, dict)) and len(info) > 0:
-                has_models = True
+    def _build_prompt(self, context: str) -> str:
+        return _CURATOR_SYSTEM + "\n\n" + _CURATOR_USER.format(context=context)
 
-            if has_models:
-                gpu_info = "Ollama running (GPU support depends on installation)"
-            logging.info(f"Ollama GPU status: {gpu_info}")
-        except Exception as e:
-            logging.warning(f"Could not check Ollama GPU status: {e}")
+    def _build_merge_prompt(self, partials_json: str) -> str:
+        return _MERGE_SYSTEM + "\n\n" + _MERGE_USER.format(partials=partials_json)
 
-    def _run_with_timeout(self, fn, *args, timeout: int = 180, **kwargs):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(fn, *args, **kwargs)
-            try:
-                return future.result(timeout=timeout)
-            except concurrent.futures.TimeoutError:
-                logging.error("Ollama request timed out after %s seconds.", timeout)
-                return None
-            except Exception as exc:
-                logging.error("Ollama request failed: %s", exc)
-                return None
+    def _parse_knowledge_bricks(self, raw: str) -> List[Dict[str, Any]]:
+        """Parse LLM output into a list of knowledge brick dicts."""
+        parsed = safe_parse_json(raw)
+        if parsed is None:
+            return []
+        if isinstance(parsed, list):
+            # Validate each item has required fields
+            valid = []
+            for item in parsed:
+                if isinstance(item, dict) and "concept" in item and "content" in item:
+                    # Ensure all required fields exist with defaults
+                    item.setdefault("type", "definition")
+                    item.setdefault("importance", "medium")
+                    item.setdefault("topic", "General")
+                    valid.append(item)
+            return valid
+        return []
 
-    def _check_ollama(self) -> bool:
-        """Check if Ollama is running and accessible."""
-        try:
-            ollama.list()
-            return True
-        except Exception:
-            return False
+    def _bricks_to_markdown(self, bricks: List[Dict[str, Any]]) -> str:
+        """Convert structured bricks to readable Markdown for downstream agents."""
+        if not bricks:
+            return ""
+        lines = []
+        for b in bricks:
+            concept = b.get("concept", "")
+            content = b.get("content", "")
+            btype = b.get("type", "")
+            topic = b.get("topic", "")
+            lines.append(f"- **[{btype.upper()}]** {concept} ({topic}): {content}")
+        return "\n".join(lines)
 
-    def extract_knowledge(self, md_content: str) -> str:
-        """Extract key concepts as structured 'Knowledge Bricks' MD.
+    def extract_knowledge(
+        self,
+        md_content: str,
+        rag_indexer: Optional[RAGIndexer] = None,
+        top_k: int = 8,
+    ) -> str:
+        """Extract knowledge bricks from document content.
 
-        Robustness:
-        - The initial extraction can time out on long PDFs.
-        - If the primary attempt fails, fall back to chunk-based extraction + merge.
+        If a RAGIndexer is provided, uses RAG to retrieve relevant chunks
+        and processes them in parallel batches.
+        Otherwise falls back to chunked sequential processing.
+
+        Args:
+            md_content: Full extracted Markdown text.
+            rag_indexer: Pre-built RAG index (optional but recommended).
+            top_k: Number of chunks to retrieve per query.
+
+        Returns:
+            Markdown string of knowledge bricks for downstream agents.
         """
+        if self.metrics:
+            self.metrics.start_timer("curator")
 
-        def _build_prompt(source: str) -> str:
-            return f"""
-[SYSTEM: KNOWLEDGE CURATOR]
-Extract ONLY the core concepts, definitions, formulas, and key facts from the source material.
-Ignore examples, exercises, images, noise.
-
-Format as clean Markdown bullet list:
-- Concept 1: definition/formula
-- Concept 2: ...
-
-IMPORTANT LATEX AND FORMAT RULES:
-- LATEX SAFETY RULES: Use ONLY valid KaTeX commands. NEVER invent, truncate, or hallucinate LaTeX commands (e.g., NO \\ullet, \\ext, \\heta). ONLY use standard operators like \\cdot, \\sin, \\cos, \\theta, \\frac, ^{{}}, _{{}}. 
-- Use KaTeX-compatible LaTeX for math, wrap inline math with $...$, and keep on a SINGLE LINE.
-- DO NOT break down equations into multiple lines (NO OCR-style formatting).
-- Double escape backslashes in LaTeX: e.g. $\\\\cos(\\\\theta)$. If unsure, output plain text instead of broken LaTeX!
-- DO NOT use emojis or decorative unicode symbols.
-- Match source language. No fluff.
-
-SOURCE:
-{source}
-            """.strip()
-
-        def _chunk_text(text: str, chunk_size: int = 3000, overlap: int = 300) -> list[str]:
-            text = text or ""
-            if len(text) <= chunk_size:
-                return [text]
-
-            chunks: list[str] = []
-            start = 0
-            n = len(text)
-            while start < n:
-                end = min(n, start + chunk_size)
-                chunks.append(text[start:end])
-                if end >= n:
-                    break
-                start = max(0, end - overlap)
-            return chunks
-
-        prompt = _build_prompt(md_content)
-
-
-        logging.info("Extracting knowledge bricks...")
-        if not self._check_ollama():
-            logging.error(
-                "Ollama is not running or accessible. Please start Ollama and ensure the model is available."
-            )
+        if not self.llm.is_available():
+            logger.error("Curator: Ollama is not running.")
+            if self.metrics:
+                self.metrics.stop_timer("curator")
             return ""
 
-        response = self._run_with_timeout(
-            ollama.generate,
-            model=self.model,
-            prompt=prompt,
-            keep_alive=0,
-            options={"num_ctx": 4096, "num_gpu": 0},
-            timeout=self.timeout,
-        )
+        logger.info("Curator: Extracting knowledge bricks...")
 
-        def _extract_from_response(resp) -> str:
-            if resp is None:
-                return ""
-            if isinstance(resp, dict):
-                kb = resp.get("response", "")
-                if not kb.strip():
-                    kb = resp.get("thinking", "")
-                return (kb or "").strip()
-            kb = getattr(resp, "response", "") or ""
-            if not kb.strip():
-                kb = getattr(resp, "thinking", "") or ""
-            return (kb or "").strip()
+        # Strategy: if RAG index available, query with broad topics
+        # Otherwise chunk the document directly
+        if rag_indexer is not None and rag_indexer.chunks:
+            contexts = self._get_rag_contexts(rag_indexer, top_k)
+        else:
+            contexts = self._get_chunked_contexts(md_content)
 
-        # Primary attempt
-        knowledge_bricks = _extract_from_response(response)
+        logger.info(f"Curator: Processing {len(contexts)} context segments in parallel...")
 
-        # Fallback: chunk-based extraction + merge
-        if not knowledge_bricks:
-            logging.warning("Primary knowledge extraction failed/empty. Falling back to chunk-based extraction.")
-            chunks = _chunk_text(md_content, chunk_size=3000, overlap=300)
+        # Task 6: parallelize context segment processing
+        all_bricks: List[Dict[str, Any]] = []
 
-            partials: list[str] = []
-            for i, ch in enumerate(chunks, 1):
-                logging.info("Extracting chunk %s/%s...", i, len(chunks))
-                ch_prompt = _build_prompt(ch)
-                ch_resp = self._run_with_timeout(
-                    ollama.generate,
-                    model=self.model,
-                    prompt=ch_prompt,
-                    keep_alive=0,
-                    options={"num_ctx": 2048, "num_gpu": 0},
-                    timeout=min(self.timeout, 240),
-                )
-                kb = _extract_from_response(ch_resp)
-                if kb:
-                    partials.append(kb)
-
-            merged_source = "\n".join(partials)
-            if not merged_source.strip():
-                return ""
-
-            merge_prompt = f"""
-[SYSTEM: KNOWLEDGE CURATOR]
-You are given multiple partial knowledge-brick bullet lists.
-Deduplicate and merge them into ONE clean Markdown bullet list of core concepts.
-Rules:
-- Keep key definitions/formulas.
-- Remove redundancy.
-- Output only bullet lines starting with '- '.
-
-PARTIALS:
-{merged_source}
-            """.strip()
-
-            merge_resp = self._run_with_timeout(
-                ollama.generate,
-                model=self.model,
-                prompt=merge_prompt,
-                keep_alive=0,
-                options={"num_ctx": 2048, "num_gpu": 0},
-                timeout=min(self.timeout, 240),
+        def _process_segment(idx_ctx):
+            idx, ctx = idx_ctx
+            prompt = self._build_prompt(ctx)
+            if self.metrics:
+                self.metrics.add_token_usage("curator", prompt)
+            raw = self.llm.generate(
+                prompt=prompt,
+                options={"temperature": 0.1, "num_ctx": 4096},
             )
+            if raw:
+                bricks = self._parse_knowledge_bricks(raw)
+                logger.info(f"Curator: Segment {idx+1}/{len(contexts)} → {len(bricks)} bricks")
+                return bricks
+            return []
 
-            knowledge_bricks = _extract_from_response(merge_resp)
+        max_workers = min(3, len(contexts))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(_process_segment, (i, ctx)): i
+                for i, ctx in enumerate(contexts)
+            }
+            for future in as_completed(futures):
+                try:
+                    bricks = future.result()
+                    all_bricks.extend(bricks)
+                except Exception as exc:
+                    logger.error(f"Curator: Segment processing failed: {exc}")
 
+        # Deduplicate if we have multiple segments
+        if len(contexts) > 1 and all_bricks:
+            all_bricks = self._deduplicate_bricks(all_bricks)
+
+        if not all_bricks:
+            logger.warning("Curator: No knowledge bricks extracted.")
+            if self.metrics:
+                self.metrics.stop_timer("curator")
+            return ""
+
+        # Save structured JSON for debugging
         OUTPUT_DIR = Path("outputs")
         OUTPUT_DIR.mkdir(exist_ok=True)
-        (OUTPUT_DIR / "knowledge_bricks.md").write_text(knowledge_bricks or "", encoding="utf-8")
-        return knowledge_bricks or ""
+        (OUTPUT_DIR / "knowledge_bricks.json").write_text(
+            json.dumps(all_bricks, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
 
+        # Convert to Markdown for downstream agents
+        result = self._bricks_to_markdown(all_bricks)
+        (OUTPUT_DIR / "knowledge_bricks.md").write_text(result, encoding="utf-8")
+
+        logger.info(f"Curator: Extracted {len(all_bricks)} knowledge bricks.")
+
+        if self.metrics:
+            self.metrics.stop_timer("curator")
+            self.metrics.metrics.rag_chunks_used = len(contexts)
+
+        return result
+
+    def _get_rag_contexts(self, rag_indexer: RAGIndexer, top_k: int) -> List[str]:
+        """Query RAG index with broad educational topic queries."""
+        queries = [
+            "core concepts definitions principles",
+            "mathematical formulas equations theorems",
+            "key terminology important terms",
+            "processes algorithms steps procedures",
+            "learning objectives outcomes",
+        ]
+        seen: set = set()
+        contexts: List[str] = []
+        for query in queries:
+            chunks = rag_indexer.retrieve(query, top_k=top_k)
+            for chunk in chunks:
+                # Deduplicate by first 100 chars
+                key = chunk[:100]
+                if key not in seen:
+                    seen.add(key)
+                    contexts.append(chunk)
+
+        # Group into batches of ~3000 chars to stay within context window
+        return self._group_into_batches(contexts, max_chars=3000)
+
+    def _get_chunked_contexts(self, md_content: str) -> List[str]:
+        """Fallback: chunk the document directly."""
+        chunks = chunk_document(md_content, chunk_size=3000, overlap=200)
+        return chunks
+
+    def _group_into_batches(self, chunks: List[str], max_chars: int = 3000) -> List[str]:
+        """Group chunks into batches that fit within max_chars."""
+        batches: List[str] = []
+        current = ""
+        for chunk in chunks:
+            if len(current) + len(chunk) + 4 <= max_chars:
+                current = (current + "\n\n" + chunk).strip()
+            else:
+                if current:
+                    batches.append(current)
+                current = chunk
+        if current:
+            batches.append(current)
+        return batches
+
+    def _deduplicate_bricks(self, bricks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Remove duplicate bricks by concept name (case-insensitive)."""
+        seen_concepts: set = set()
+        unique: List[Dict[str, Any]] = []
+        for brick in bricks:
+            key = brick.get("concept", "").lower().strip()
+            if key and key not in seen_concepts:
+                seen_concepts.add(key)
+                unique.append(brick)
+        return unique
